@@ -36,6 +36,10 @@ paints a placeholder rect with a playback-progress tick.
 Tracked here so the `draw_at` stub doesn't stay a stub by accident. Rough
 ordering — each phase depends on the primitives from the one before.
 
+> For the **outstanding** items with implementation notes per entry, see
+> [BACKLOG.md](./BACKLOG.md). This README section exists to show what's
+> already landed versus what's still ahead.
+
 ### Phase 0 — Correctness fixes on the existing surface
 
 - [x] **Pause-pose:** `set_playing(false)` now freezes at the last
