@@ -47,8 +47,11 @@ ordering — each phase depends on the primitives from the one before.
 
 ### Phase 1 — Minimum viable rendering
 
-- [ ] **Solid layer** (`ty: 1`) — single color fill. Easiest layer type;
-      unlocks basic backgrounds.
+- [x] **Solid layer** (`ty: 1`) — single color fill. Source-space
+      composition is mapped onto the destination rect (stretch fit;
+      aspect modes deferred). Layers respect `ip` / `op` visibility
+      windows. Transform infrastructure (`anchor`, `position`, `scale`,
+      `rotation`, `opacity`) parses static values today.
 - [ ] **Transform keyframes** (`ks.p`, `ks.s`, `ks.r`, `ks.o`, `ks.a`) —
       position, scale, rotation, opacity, anchor-point. Linear interpolation
       first; bezier easing (`i.x`/`o.x`) after.

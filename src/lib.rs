@@ -20,10 +20,14 @@
 //! - Image asset layers need a `blinc_image` bridge; tracked separately.
 
 use blinc_canvas_kit::{Player, SketchContext};
-use blinc_core::layer::{Brush, Color, CornerRadius, Rect};
+use blinc_core::draw::Transform;
+use blinc_core::layer::Rect;
 use blinc_core::DrawContext;
 
+mod layer;
 mod parser;
+
+use layer::Layer;
 
 /// Callback fired when playback crosses a marker's timestamp.
 type MarkerCallback = Box<dyn FnMut(&Marker) + Send + 'static>;
@@ -54,6 +58,9 @@ pub struct Marker {
 /// A loaded Lottie scene, ready to be rendered into a `Sketch`.
 pub struct LottiePlayer {
     root: parser::LottieRoot,
+    /// Layers parsed from `root.layers` in source order. Render uses
+    /// reverse iteration so the first array entry composites on top.
+    layers: Vec<Layer>,
     markers: Vec<Marker>,
     is_playing: bool,
     /// Internal seek position in seconds. Added to the `t` passed to
@@ -94,8 +101,14 @@ impl LottiePlayer {
                 duration_seconds: m.duration_frames / fr,
             })
             .collect();
+        let layers = root
+            .layers
+            .iter()
+            .map(|v| Layer::from_value(v, fr))
+            .collect();
         Self {
             root,
+            layers,
             markers,
             is_playing: true,
             seek_offset: 0.0,
@@ -207,32 +220,28 @@ impl Player for LottiePlayer {
         self.fire_markers(prev, scene_t);
         self.last_scene_t = scene_t;
 
-        // Placeholder render: outline rect with a subtle fill so the
-        // user can verify the player is wired up and the layout/time
-        // plumbing works end-to-end. Real shape-layer rendering will
-        // replace this in the parser module.
-        let dc: &mut dyn DrawContext = ctx.draw_context();
-        let cr = CornerRadius::uniform(4.0);
-        dc.fill_rect(rect, cr, Brush::Solid(Color::rgba(0.05, 0.05, 0.1, 0.6)));
+        // Map Lottie source-space coordinates onto the destination rect.
+        // Stretches the composition to fill — aspect-fit / aspect-fill
+        // modes are intentionally deferred (track via README Phase 5
+        // perf/format work).
+        let src_w = self.root.width.max(1) as f32;
+        let src_h = self.root.height.max(1) as f32;
+        let sx = rect.width() / src_w;
+        let sy = rect.height() / src_h;
 
-        // Flash a progress tick proportional to scene_t / duration so a
-        // caller can visually confirm playback is advancing.
-        if let Some(dur) = self.duration() {
-            if dur > 0.0 {
-                let p = (scene_t / dur).clamp(0.0, 1.0);
-                let tick = Rect::new(
-                    rect.x(),
-                    rect.y() + rect.height() - 2.0,
-                    rect.width() * p,
-                    2.0,
-                );
-                dc.fill_rect(
-                    tick,
-                    CornerRadius::uniform(0.0),
-                    Brush::Solid(Color::rgba(0.5, 0.8, 1.0, 1.0)),
-                );
-            }
+        let dc: &mut dyn DrawContext = ctx.draw_context();
+        dc.push_transform(Transform::translate(rect.x(), rect.y()));
+        dc.push_transform(Transform::scale(sx, sy));
+
+        // Lottie convention: layers earlier in the array composite on
+        // top of layers later in the array. Iterate in reverse so we
+        // draw back-to-front.
+        for layer in self.layers.iter().rev() {
+            layer.render(dc, scene_t);
         }
+
+        dc.pop_transform();
+        dc.pop_transform();
     }
 
     fn seek(&mut self, t: f32) {
