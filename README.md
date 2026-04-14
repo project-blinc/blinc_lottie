@@ -75,7 +75,9 @@ ordering — each phase depends on the primitives from the one before.
       stable. Interpolate per-vertex positions.
 - [ ] **Trim paths** (`tm`) — start/end/offset animation for "drawn-on"
       effects. Requires per-segment length parameterization.
-- [ ] **Group** (`gr`) — nested transform + children.
+- [x] **Group** (`gr`) — nested transform + children. (Landed alongside
+      Phase 1.3 — single-fill / single-stroke render model; merge-paths
+      and ordered fill/stroke stacks remain.)
 
 ### Phase 3 — Visual effects
 
