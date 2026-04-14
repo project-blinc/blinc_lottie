@@ -38,12 +38,12 @@ ordering — each phase depends on the primitives from the one before.
 
 ### Phase 0 — Correctness fixes on the existing surface
 
-- [ ] **Pause-pose:** `set_playing(false)` currently freezes at `0.0`. Store
-      a `last_t: f32` on `LottiePlayer` updated inside `draw_at` so
-      `paused_at` can freeze at the actual last-rendered scene time.
-- [ ] **Marker/event emission:** Lottie supports named markers on the
-      timeline. Expose a callback / event queue so host sketches can react
-      to them (plays well with Blinc's reactive model).
+- [x] **Pause-pose:** `set_playing(false)` now freezes at the last
+      actually-rendered scene time via `last_scene_t`.
+- [x] **Marker/event emission:** `Marker` public type (name + seconds),
+      `on_marker` / `clear_on_marker` callbacks, emission on the
+      `(prev, current]` interval with loop-wrap support. Covered by unit
+      tests.
 
 ### Phase 1 — Minimum viable rendering
 

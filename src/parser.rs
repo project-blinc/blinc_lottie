@@ -48,4 +48,28 @@ pub(crate) struct LottieRoot {
     /// the outer types.
     #[serde(default)]
     pub layers: Vec<serde_json::Value>,
+
+    /// Named timeline markers. Exposed via `LottiePlayer::markers()` and
+    /// fired through the optional `on_marker` callback as playback
+    /// crosses their timestamps.
+    #[serde(default)]
+    pub markers: Vec<RawMarker>,
+}
+
+/// Raw marker as it appears in the JSON — frame-based. Converted to the
+/// seconds-based public [`crate::Marker`] at `LottiePlayer` construction
+/// so downstream code never has to think in frames.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawMarker {
+    /// Comment / name field. Optional in some exporters.
+    #[serde(rename = "cm", default)]
+    pub name: Option<String>,
+
+    /// Marker time in frames.
+    #[serde(rename = "tm")]
+    pub time_frames: f32,
+
+    /// Marker duration in frames. `0` for a point-in-time marker.
+    #[serde(rename = "dr", default)]
+    pub duration_frames: f32,
 }
