@@ -52,9 +52,12 @@ ordering — each phase depends on the primitives from the one before.
       aspect modes deferred). Layers respect `ip` / `op` visibility
       windows. Transform infrastructure (`anchor`, `position`, `scale`,
       `rotation`, `opacity`) parses static values today.
-- [ ] **Transform keyframes** (`ks.p`, `ks.s`, `ks.r`, `ks.o`, `ks.a`) —
-      position, scale, rotation, opacity, anchor-point. Linear interpolation
-      first; bezier easing (`i.x`/`o.x`) after.
+- [x] **Transform keyframes (linear)** (`ks.p`, `ks.s`, `ks.r`, `ks.o`,
+      `ks.a`) — position, scale, rotation, opacity, anchor-point. Linear
+      interpolation, hold keyframes (`h: 1`), clamp-before-first /
+      clamp-after-last semantics.
+- [ ] **Bezier easing** (`i.x` / `o.x` tangent handles on keyframes) —
+      follow-up to linear keyframes; hit unit-parity with AE output.
 - [ ] **Shape layer** (`ty: 4`) — rectangles (`rc`), ellipses (`el`),
       polystars (`sr`), polygons (`sr` with `sy: 2`).
 - [ ] **Fill** (`fl`) and **Stroke** (`st`) shape items — map to
