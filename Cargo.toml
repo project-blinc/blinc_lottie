@@ -1,0 +1,28 @@
+[package]
+name = "blinc_lottie"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Lottie animation player for Blinc sketches — implements blinc_canvas_kit's Player trait"
+repository = "https://github.com/project-blinc/blinc_lottie"
+readme = "README.md"
+rust-version = "1.75"
+
+# Standalone package — NOT a member of the Blinc workspace. Lives under
+# `/packages/` which is gitignored and workspace-excluded from the main
+# Blinc repo, so this crate has its own upstream, own Cargo.lock, and
+# evolves independently of Blinc's release cadence.
+
+[dependencies]
+# Path dep during local dev; pin to the crates.io version once published:
+#
+#   blinc_canvas_kit = "0.5"
+blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
+blinc_core = { path = "../../crates/blinc_core" }
+
+# JSON parsing for Lottie's `.json` / `.lottie` (zipped JSON) format.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error plumbing.
+thiserror = "2.0"
