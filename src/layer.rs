@@ -20,6 +20,8 @@ use blinc_core::layer::{Brush, Color, CornerRadius, Rect};
 use blinc_core::DrawContext;
 use serde_json::Value;
 
+use crate::shape::ShapeContent;
+
 /// Parsed, render-ready Lottie layer.
 #[derive(Debug, Clone)]
 pub(crate) struct Layer {
@@ -42,9 +44,12 @@ pub(crate) enum LayerKind {
         height: f32,
         color: Color,
     },
-    /// Layer types not yet implemented (shape, image, text, precomp,
-    /// null, …). Render as a no-op so the rest of the scene still
-    /// composites correctly.
+    /// Vector shape layer (`ty: 4`). Holds a tree of shape groups, each
+    /// composed of geometry items + paint items (fill, stroke).
+    Shape(ShapeContent),
+    /// Layer types not yet implemented (image, text, precomp, null,
+    /// …). Render as a no-op so the rest of the scene still composites
+    /// correctly.
     Unknown,
 }
 
@@ -80,7 +85,7 @@ pub(crate) enum AnimatedF32 {
 }
 
 impl AnimatedF32 {
-    fn sample(&self, t: f32) -> f32 {
+    pub(crate) fn sample(&self, t: f32) -> f32 {
         match self {
             Self::Static(v) => *v,
             Self::Keyframed(keys) => sample_scalar(keys, t),
@@ -90,7 +95,7 @@ impl AnimatedF32 {
     /// Apply `f` to every value in the animation (static value plus
     /// all keyframe values). Used to normalize Lottie source units
     /// (percent scale, degrees, 0–100 opacity) at parse time.
-    fn map(self, f: impl Fn(f32) -> f32) -> Self {
+    pub(crate) fn map(self, f: impl Fn(f32) -> f32) -> Self {
         match self {
             Self::Static(v) => Self::Static(f(v)),
             Self::Keyframed(ks) => Self::Keyframed(
@@ -110,14 +115,14 @@ pub(crate) enum AnimatedVec2 {
 }
 
 impl AnimatedVec2 {
-    fn sample(&self, t: f32) -> [f32; 2] {
+    pub(crate) fn sample(&self, t: f32) -> [f32; 2] {
         match self {
             Self::Static(v) => *v,
             Self::Keyframed(keys) => sample_vec2(keys, t),
         }
     }
 
-    fn map(self, f: impl Fn([f32; 2]) -> [f32; 2]) -> Self {
+    pub(crate) fn map(self, f: impl Fn([f32; 2]) -> [f32; 2]) -> Self {
         match self {
             Self::Static(v) => Self::Static(f(v)),
             Self::Keyframed(ks) => Self::Keyframed(
@@ -125,6 +130,30 @@ impl AnimatedVec2 {
                     .map(|k| Vec2Key { value: f(k.value), ..k })
                     .collect(),
             ),
+        }
+    }
+}
+
+/// A single keyframe in a 4D vector property animation (typically RGBA color).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Vec4Key {
+    pub t: f32,
+    pub value: [f32; 4],
+    pub hold: bool,
+}
+
+/// A 4D vector property (e.g. RGBA color) that may be static or keyframed.
+#[derive(Debug, Clone)]
+pub(crate) enum AnimatedVec4 {
+    Static([f32; 4]),
+    Keyframed(Vec<Vec4Key>),
+}
+
+impl AnimatedVec4 {
+    pub(crate) fn sample(&self, t: f32) -> [f32; 4] {
+        match self {
+            Self::Static(v) => *v,
+            Self::Keyframed(keys) => sample_vec4(keys, t),
         }
     }
 }
@@ -182,6 +211,36 @@ fn sample_vec2(keys: &[Vec2Key], t: f32) -> [f32; 2] {
     last.value
 }
 
+fn sample_vec4(keys: &[Vec4Key], t: f32) -> [f32; 4] {
+    if keys.is_empty() {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    if t <= keys[0].t {
+        return keys[0].value;
+    }
+    let last = keys.last().unwrap();
+    if t >= last.t {
+        return last.value;
+    }
+    for pair in keys.windows(2) {
+        let k0 = &pair[0];
+        let k1 = &pair[1];
+        if t >= k0.t && t < k1.t {
+            if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
+                return k0.value;
+            }
+            let u = (t - k0.t) / (k1.t - k0.t);
+            return [
+                k0.value[0] + (k1.value[0] - k0.value[0]) * u,
+                k0.value[1] + (k1.value[1] - k0.value[1]) * u,
+                k0.value[2] + (k1.value[2] - k0.value[2]) * u,
+                k0.value[3] + (k1.value[3] - k0.value[3]) * u,
+            ];
+        }
+    }
+    last.value
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Transform
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,7 +277,7 @@ impl TransformSpec {
         }
     }
 
-    fn from_value(v: Option<&Value>, fr: f32) -> Self {
+    pub(crate) fn from_value(v: Option<&Value>, fr: f32) -> Self {
         let Some(v) = v else { return Self::identity() };
         Self {
             anchor: parse_animated_vec2(v.get("a"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0])),
@@ -248,6 +307,7 @@ pub(crate) struct SampledTransform {
     pub opacity: f32,
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +324,7 @@ impl Layer {
         let transform = TransformSpec::from_value(v.get("ks"), fr);
         let kind = match ty {
             1 => parse_solid(v),
+            4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
             _ => LayerKind::Unknown,
         };
         Self {
@@ -297,6 +358,9 @@ impl Layer {
                     CornerRadius::uniform(0.0),
                     Brush::Solid(*color),
                 );
+            }
+            LayerKind::Shape(content) => {
+                content.render(dc, scene_t);
             }
             LayerKind::Unknown => {}
         }
@@ -363,7 +427,7 @@ fn parse_hex_color(s: &str) -> Option<Color> {
 /// Returns `None` only if the surrounding object is missing entirely
 /// (so the caller can supply a sensible default); otherwise this falls
 /// back to `Static(0.0)` for malformed `k` payloads.
-fn parse_animated_scalar(v: Option<&Value>, fr: f32) -> Option<AnimatedF32> {
+pub(crate) fn parse_animated_scalar(v: Option<&Value>, fr: f32) -> Option<AnimatedF32> {
     let v = v?;
     let k = v.get("k")?;
 
@@ -395,7 +459,7 @@ fn parse_animated_scalar(v: Option<&Value>, fr: f32) -> Option<AnimatedF32> {
 /// Parse an animatable 2D vector property. Same payload shape as
 /// [`parse_animated_scalar`], but value fields are `[x, y, z?]` and we
 /// take the first two components.
-fn parse_animated_vec2(v: Option<&Value>, fr: f32) -> Option<AnimatedVec2> {
+pub(crate) fn parse_animated_vec2(v: Option<&Value>, fr: f32) -> Option<AnimatedVec2> {
     let v = v?;
     let k = v.get("k")?;
 
@@ -417,6 +481,67 @@ fn parse_animated_vec2(v: Option<&Value>, fr: f32) -> Option<AnimatedVec2> {
     }
 
     Some(AnimatedVec2::Static([0.0, 0.0]))
+}
+
+/// Parse an animatable 4D vector property — matches the shape of
+/// [`parse_animated_vec2`] but with 4 components. Lottie uses this for
+/// RGBA colors (`{ "k": [r, g, b, a] }` or keyframed equivalent).
+pub(crate) fn parse_animated_vec4(v: Option<&Value>, fr: f32) -> Option<AnimatedVec4> {
+    let v = v?;
+    let k = v.get("k")?;
+
+    if let Some(arr) = k.as_array() {
+        if arr.is_empty() {
+            return Some(AnimatedVec4::Static([0.0, 0.0, 0.0, 0.0]));
+        }
+        if arr[0].is_object() {
+            let keys = collect_vec4_keys(arr, fr);
+            if keys.is_empty() {
+                return Some(AnimatedVec4::Static([0.0, 0.0, 0.0, 0.0]));
+            }
+            return Some(AnimatedVec4::Keyframed(keys));
+        }
+        // Static `[r, g, b, a]`. Missing components default to 0
+        // (alpha defaults to 1 if only RGB was supplied).
+        let r = arr.first().and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let g = arr.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let b = arr.get(2).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let a = arr.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+        return Some(AnimatedVec4::Static([r, g, b, a]));
+    }
+
+    Some(AnimatedVec4::Static([0.0, 0.0, 0.0, 0.0]))
+}
+
+fn collect_vec4_keys(arr: &[Value], fr: f32) -> Vec<Vec4Key> {
+    let mut last_value = [0.0f32, 0.0, 0.0, 1.0];
+    arr.iter()
+        .filter_map(|kf| {
+            let t_frames = kf.get("t")?.as_f64()? as f32;
+            let value = kf
+                .get("s")
+                .and_then(|s| vec4_from_s(s))
+                .unwrap_or(last_value);
+            last_value = value;
+            let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
+            Some(Vec4Key {
+                t: t_frames / fr,
+                value,
+                hold,
+            })
+        })
+        .collect()
+}
+
+fn vec4_from_s(v: &Value) -> Option<[f32; 4]> {
+    let arr = v.as_array()?;
+    let r = arr.first().and_then(Value::as_f64)? as f32;
+    let g = arr.get(1).and_then(Value::as_f64)? as f32;
+    let b = arr.get(2).and_then(Value::as_f64)? as f32;
+    // Alpha is allowed to be missing — default to opaque to match
+    // the static-array convention above.
+    let a = arr.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    Some([r, g, b, a])
 }
 
 fn collect_scalar_keys(arr: &[Value], fr: f32) -> Vec<ScalarKey> {
@@ -481,7 +606,7 @@ fn vec2_from_s(v: &Value) -> Option<[f32; 2]> {
 // Transform application
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn push_layer_transform(dc: &mut dyn DrawContext, xform: &SampledTransform) {
+pub(crate) fn push_layer_transform(dc: &mut dyn DrawContext, xform: &SampledTransform) {
     // Compose: T(p) · R(r) · S(s) · T(-a)
     // Pop order is the reverse, handled by `pop_layer_transform`.
     dc.push_transform(Transform::translate(xform.position[0], xform.position[1]));
@@ -491,7 +616,7 @@ fn push_layer_transform(dc: &mut dyn DrawContext, xform: &SampledTransform) {
     dc.push_opacity(xform.opacity);
 }
 
-fn pop_layer_transform(dc: &mut dyn DrawContext) {
+pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
     dc.pop_opacity();
     dc.pop_transform();
     dc.pop_transform();
@@ -553,7 +678,9 @@ mod tests {
 
     #[test]
     fn unknown_type_falls_through() {
-        let v = json!({ "ty": 4, "ip": 0, "op": 60 });
+        // ty: 99 is not a real Lottie type — picks up the Unknown path.
+        // (ty: 4 is now Shape; ty: 1 is Solid.)
+        let v = json!({ "ty": 99, "ip": 0, "op": 60 });
         let layer = Layer::from_value(&v, 60.0);
         assert!(matches!(layer.kind, LayerKind::Unknown));
     }

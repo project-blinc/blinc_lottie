@@ -26,6 +26,7 @@ use blinc_core::DrawContext;
 
 mod layer;
 mod parser;
+mod shape;
 
 use layer::Layer;
 

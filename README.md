@@ -58,10 +58,14 @@ ordering — each phase depends on the primitives from the one before.
       clamp-after-last semantics.
 - [ ] **Bezier easing** (`i.x` / `o.x` tangent handles on keyframes) —
       follow-up to linear keyframes; hit unit-parity with AE output.
-- [ ] **Shape layer** (`ty: 4`) — rectangles (`rc`), ellipses (`el`),
-      polystars (`sr`), polygons (`sr` with `sy: 2`).
-- [ ] **Fill** (`fl`) and **Stroke** (`st`) shape items — map to
-      `DrawContext::fill_path` / `stroke_path`.
+- [x] **Shape layer** (`ty: 4`) — rectangles (`rc`) with corner radius,
+      ellipses (`el`) via cubic-bezier path approximation, groups (`gr`)
+      with their own transforms (`tr`) and nested groups. Polystar
+      (`sr`) and path (`sh`) deferred.
+- [x] **Fill** (`fl`) and **Stroke** (`st`) shape items — map to
+      `DrawContext::fill_path` / `stroke_path`. Color and opacity are
+      animatable; stroke width is animatable. Dash patterns + line
+      caps/joins use `Stroke::new` defaults pending Phase 3.
 
 ### Phase 2 — Path geometry
 
