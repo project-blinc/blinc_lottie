@@ -250,16 +250,60 @@ fn sample_path(keys: &[PathKey], t: f32) -> PathShape {
     last.value.clone()
 }
 
+/// Paint source for a fill or stroke item. Solid color is the
+/// original `fl` / `st` case; gradient variants cover `gf` / `gs`
+/// (Lottie gradient fill / stroke).
+///
+/// Stops are currently parsed static-only — animating the stop
+/// array mid-gradient is rare, and storing a full
+/// `[t, r, g, b, ...]` keyframe list per gradient doubles the
+/// shape-state size for a narrow use case. Endpoints (`start` /
+/// `end`) are animatable via standard `AnimatedVec2`, which
+/// covers most motion-design gradient animations (sliding the
+/// gradient across a shape, radial zoom-in/out, etc.).
+#[derive(Debug, Clone)]
+enum Paint {
+    Solid(AnimatedVec4),
+    LinearGradient {
+        start: AnimatedVec2,
+        end: AnimatedVec2,
+        stops: Vec<GradientStopSpec>,
+    },
+    RadialGradient {
+        /// Gradient origin (Lottie `s`).
+        start: AnimatedVec2,
+        /// A point on the outer radius (Lottie `e`). Distance from
+        /// `start` to `end` becomes the gradient radius — this
+        /// matches how AE authors drag a radial gradient handle.
+        end: AnimatedVec2,
+        stops: Vec<GradientStopSpec>,
+    },
+}
+
+/// A single parsed gradient stop in Blinc RGBA space (`[0, 1]`
+/// per channel). Alpha stops from a Lottie gradient — stored in
+/// the same flat array after the color stops — are merged into
+/// the per-stop alpha at parse time rather than kept as a
+/// separate channel, since Blinc's [`blinc_core::GradientStop`]
+/// has one color-with-alpha value per offset.
+#[derive(Debug, Clone, Copy)]
+struct GradientStopSpec {
+    offset: f32,
+    color: [f32; 4],
+}
+
 #[derive(Debug, Clone)]
 struct FillSpec {
-    color: AnimatedVec4,
-    /// 0–1 multiplier on the color's alpha.
+    paint: Paint,
+    /// 0–1 multiplier applied to the paint's alpha channel at
+    /// sample time. Stacks on top of whatever alpha the paint
+    /// itself carries (solid color alpha, gradient stop alphas).
     opacity: AnimatedF32,
 }
 
 #[derive(Debug, Clone)]
 struct StrokeSpec {
-    color: AnimatedVec4,
+    paint: Paint,
     opacity: AnimatedF32,
     /// Line width in source-space pixels.
     width: AnimatedF32,
@@ -311,13 +355,14 @@ impl ShapeGroup {
         for geo in &self.geometries {
             let path = geo.to_path(t);
             if let Some(fill) = &self.fill {
-                dc.fill_path(&path, Brush::Solid(sample_paint_color(&fill.color, &fill.opacity, t)));
+                let brush = sample_paint_brush(&fill.paint, &fill.opacity, t);
+                dc.fill_path(&path, brush);
             }
             if let Some(stroke) = &self.stroke {
-                let color = sample_paint_color(&stroke.color, &stroke.opacity, t);
                 let width = stroke.width.sample(t).max(0.0);
                 if width > 0.0 {
-                    dc.stroke_path(&path, &Stroke::new(width), Brush::Solid(color));
+                    let brush = sample_paint_brush(&stroke.paint, &stroke.opacity, t);
+                    dc.stroke_path(&path, &Stroke::new(width), brush);
                 }
             }
         }
@@ -383,6 +428,61 @@ fn sample_paint_color(color: &AnimatedVec4, opacity: &AnimatedF32, t: f32) -> Co
     Color::rgba(c[0], c[1], c[2], c[3] * o)
 }
 
+/// Sample a [`Paint`] at time `t` into a Blinc [`Brush`]. Opacity
+/// stacks on top of whatever alpha the paint already carries —
+/// solid color alpha for `Paint::Solid`, per-stop alpha for the
+/// gradient variants.
+fn sample_paint_brush(paint: &Paint, opacity: &AnimatedF32, t: f32) -> Brush {
+    let op = opacity.sample(t).clamp(0.0, 1.0);
+    match paint {
+        Paint::Solid(color) => Brush::Solid(sample_paint_color(color, opacity, t)),
+        Paint::LinearGradient { start, end, stops } => {
+            let s = start.sample(t);
+            let e = end.sample(t);
+            let stops = stops
+                .iter()
+                .map(|gs| {
+                    blinc_core::GradientStop::new(
+                        gs.offset,
+                        Color::rgba(gs.color[0], gs.color[1], gs.color[2], gs.color[3] * op),
+                    )
+                })
+                .collect();
+            Brush::Gradient(blinc_core::Gradient::linear_with_stops(
+                blinc_core::layer::Point::new(s[0], s[1]),
+                blinc_core::layer::Point::new(e[0], e[1]),
+                stops,
+            ))
+        }
+        Paint::RadialGradient { start, end, stops } => {
+            let s = start.sample(t);
+            let e = end.sample(t);
+            // Lottie encodes the radial gradient as two points: the
+            // origin (`s`) and a point on the outer edge (`e`). The
+            // radius is the Euclidean distance between them — matches
+            // how AE's radial gradient handle drags outward from the
+            // origin.
+            let dx = e[0] - s[0];
+            let dy = e[1] - s[1];
+            let radius = (dx * dx + dy * dy).sqrt();
+            let stops = stops
+                .iter()
+                .map(|gs| {
+                    blinc_core::GradientStop::new(
+                        gs.offset,
+                        Color::rgba(gs.color[0], gs.color[1], gs.color[2], gs.color[3] * op),
+                    )
+                })
+                .collect();
+            Brush::Gradient(blinc_core::Gradient::radial_with_stops(
+                blinc_core::layer::Point::new(s[0], s[1]),
+                radius,
+                stops,
+            ))
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Parsing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,7 +507,9 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
             "el" => group.geometries.push(parse_ellipse(item, fr)),
             "sh" => group.geometries.push(parse_path(item, fr)),
             "fl" => group.fill = Some(parse_fill(item, fr)),
+            "gf" => group.fill = Some(parse_gradient_fill(item, fr)),
             "st" => group.stroke = Some(parse_stroke(item, fr)),
+            "gs" => group.stroke = Some(parse_gradient_stroke(item, fr)),
             "tr" => group.transform = Some(TransformSpec::from_value(Some(item), fr)),
             "gr" => group.children.push(parse_group(item, fr)),
             _ => {} // unimplemented item — skip silently
@@ -553,23 +655,161 @@ fn collect_path_keys(arr: &[Value], fr: f32) -> Vec<PathKey> {
 
 fn parse_fill(v: &Value, fr: f32) -> FillSpec {
     FillSpec {
-        color: parse_animated_vec4(v.get("c"), fr)
-            .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0])),
-        opacity: parse_animated_scalar(v.get("o"), fr)
-            .unwrap_or(AnimatedF32::Static(100.0))
-            .map(|o| (o / 100.0).clamp(0.0, 1.0)),
+        paint: Paint::Solid(
+            parse_animated_vec4(v.get("c"), fr)
+                .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0])),
+        ),
+        opacity: parse_opacity(v, fr),
     }
 }
 
 fn parse_stroke(v: &Value, fr: f32) -> StrokeSpec {
     StrokeSpec {
-        color: parse_animated_vec4(v.get("c"), fr)
-            .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0])),
-        opacity: parse_animated_scalar(v.get("o"), fr)
-            .unwrap_or(AnimatedF32::Static(100.0))
-            .map(|o| (o / 100.0).clamp(0.0, 1.0)),
+        paint: Paint::Solid(
+            parse_animated_vec4(v.get("c"), fr)
+                .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0])),
+        ),
+        opacity: parse_opacity(v, fr),
         width: parse_animated_scalar(v.get("w"), fr).unwrap_or(AnimatedF32::Static(1.0)),
     }
+}
+
+/// Gradient fill (`gf`). Parses:
+///
+/// - `t`: `1` = linear, `2` = radial
+/// - `s`: start point (animatable vec2) — gradient origin
+/// - `e`: end point (animatable vec2) — tip for linear, outer-edge
+///   handle for radial (distance from `s` becomes the radius)
+/// - `g.p`: color-stop count
+/// - `g.k.k`: flat stop array — first `4 * p` entries are color
+///   stops (`[t, r, g, b, ...]`), optional tail is alpha stops
+///   (`[t, a, t, a, ...]`) that merge into the per-offset alpha
+///
+/// Animated stop arrays (`g.k.a == 1`) are documented as out of
+/// scope — the crate reads the keyframe array's first `s` value
+/// and pins the stops to that snapshot. Animating start/end
+/// endpoints works via the standard `AnimatedVec2` path.
+fn parse_gradient_fill(v: &Value, fr: f32) -> FillSpec {
+    FillSpec {
+        paint: parse_gradient_paint(v, fr),
+        opacity: parse_opacity(v, fr),
+    }
+}
+
+fn parse_gradient_stroke(v: &Value, fr: f32) -> StrokeSpec {
+    StrokeSpec {
+        paint: parse_gradient_paint(v, fr),
+        opacity: parse_opacity(v, fr),
+        width: parse_animated_scalar(v.get("w"), fr).unwrap_or(AnimatedF32::Static(1.0)),
+    }
+}
+
+fn parse_gradient_paint(v: &Value, fr: f32) -> Paint {
+    let kind = v.get("t").and_then(Value::as_u64).unwrap_or(1);
+    let start = parse_animated_vec2(v.get("s"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0]));
+    let end = parse_animated_vec2(v.get("e"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0]));
+    let stop_count = v
+        .get("g")
+        .and_then(|g| g.get("p"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let stop_array = v
+        .get("g")
+        .and_then(|g| g.get("k"))
+        .and_then(extract_static_stop_array);
+    let stops = stop_array
+        .map(|arr| parse_gradient_stops(&arr, stop_count))
+        .unwrap_or_default();
+    match kind {
+        2 => Paint::RadialGradient { start, end, stops },
+        _ => Paint::LinearGradient { start, end, stops },
+    }
+}
+
+/// Extract the flat stop array from a gradient's `g.k` block,
+/// which is shaped like `{ "a": 0|1, "k": <values> }`. For
+/// `a == 0` the nested `k` is the flat array directly. For
+/// `a == 1` it's a keyframe list; we take the first keyframe's
+/// `s` snapshot as documented static-stop fallback.
+fn extract_static_stop_array(gk: &Value) -> Option<Vec<f32>> {
+    let k = gk.get("k")?;
+    // Keyframed stops: pick the first keyframe's `s` snapshot.
+    if let Some(arr) = k.as_array() {
+        if arr
+            .first()
+            .map(|e| e.is_object() && e.get("t").is_some())
+            .unwrap_or(false)
+        {
+            let first = arr.first()?;
+            return first
+                .get("s")
+                .and_then(Value::as_array)
+                .map(|s_arr| s_arr.iter().filter_map(|n| n.as_f64().map(|n| n as f32)).collect());
+        }
+        // Static flat array.
+        return Some(arr.iter().filter_map(|n| n.as_f64().map(|n| n as f32)).collect());
+    }
+    None
+}
+
+/// Walk a flat gradient array into `GradientStopSpec`s. Layout:
+///
+/// ```text
+/// [t0, r0, g0, b0, t1, r1, g1, b1, …   // `n_stops` color stops
+///  at0, a0, at1, a1, …]                // optional alpha stops
+/// ```
+///
+/// Color-stop count `n_stops` comes from `g.p`. Alpha stops are
+/// paired by offset match (common case: same count + same offsets
+/// as color stops) — merged into per-stop alpha. When alpha stops
+/// are absent or mismatched we default to opaque.
+fn parse_gradient_stops(arr: &[f32], n_stops: usize) -> Vec<GradientStopSpec> {
+    if n_stops == 0 {
+        return Vec::new();
+    }
+    let color_len = n_stops * 4;
+    if arr.len() < color_len {
+        return Vec::new();
+    }
+    let mut stops: Vec<GradientStopSpec> = (0..n_stops)
+        .map(|i| {
+            let base = i * 4;
+            GradientStopSpec {
+                offset: arr[base].clamp(0.0, 1.0),
+                color: [arr[base + 1], arr[base + 2], arr[base + 3], 1.0],
+            }
+        })
+        .collect();
+    // Remaining elements after the color block are pairs of
+    // (alpha-stop-offset, alpha-value). Apply each to the nearest
+    // color stop by offset — handles the common case where the
+    // alpha stops share offsets with color stops, and degrades
+    // gracefully when they don't (alpha at the wrong stop is
+    // visually subtle enough that the fallback is acceptable until
+    // we grow per-offset alpha sampling).
+    let alpha_region = &arr[color_len..];
+    if alpha_region.len() >= 2 {
+        for pair in alpha_region.chunks_exact(2) {
+            let a_offset = pair[0].clamp(0.0, 1.0);
+            let a_value = pair[1].clamp(0.0, 1.0);
+            if let Some(nearest) = stops.iter_mut().min_by(|a, b| {
+                (a.offset - a_offset)
+                    .abs()
+                    .partial_cmp(&(b.offset - a_offset).abs())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            }) {
+                nearest.color[3] = a_value;
+            }
+        }
+    }
+    stops
+}
+
+#[inline]
+fn parse_opacity(v: &Value, fr: f32) -> AnimatedF32 {
+    parse_animated_scalar(v.get("o"), fr)
+        .unwrap_or(AnimatedF32::Static(100.0))
+        .map(|o| (o / 100.0).clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -611,7 +851,10 @@ mod tests {
         assert!(g.transform.is_some(), "tr item should populate transform");
         // Fill alpha = 1.0 source * 0.75 opacity = 0.75
         let fill = g.fill.as_ref().unwrap();
-        let c = sample_paint_color(&fill.color, &fill.opacity, 0.0);
+        let Paint::Solid(color) = &fill.paint else {
+            panic!("expected solid paint, got {:?}", fill.paint);
+        };
+        let c = sample_paint_color(color, &fill.opacity, 0.0);
         assert!((c.r - 1.0).abs() < 1e-5);
         assert!((c.g - 0.5).abs() < 1e-5);
         assert!((c.b - 0.0).abs() < 1e-5);
@@ -828,5 +1071,133 @@ mod tests {
         assert_eq!(mid.vertices.len(), 2);
         assert!((mid.vertices[0][1] - 5.0).abs() < 1e-4);
         assert!((mid.vertices[1][1] - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn parses_linear_gradient_fill() {
+        // Two color stops, red at 0 → blue at 1, linear gradient
+        // running left-to-right across the shape.
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "gf",
+                        "t": 1,
+                        "s": { "k": [0.0, 0.0] },
+                        "e": { "k": [100.0, 0.0] },
+                        "g": {
+                            "p": 2,
+                            "k": {
+                                "a": 0,
+                                "k": [
+                                    0.0, 1.0, 0.0, 0.0,
+                                    1.0, 0.0, 0.0, 1.0
+                                ]
+                            }
+                        },
+                        "o": { "k": 100.0 }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let fill = content.groups[0].fill.as_ref().expect("gradient fill parsed");
+        let Paint::LinearGradient { stops, .. } = &fill.paint else {
+            panic!("expected linear gradient, got {:?}", fill.paint);
+        };
+        assert_eq!(stops.len(), 2);
+        assert!((stops[0].color[0] - 1.0).abs() < 1e-5, "first stop red");
+        assert!((stops[1].color[2] - 1.0).abs() < 1e-5, "last stop blue");
+    }
+
+    #[test]
+    fn parses_radial_gradient_stroke() {
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "el",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] }
+                    },
+                    {
+                        "ty": "gs",
+                        "t": 2,
+                        "s": { "k": [0.0, 0.0] },
+                        "e": { "k": [50.0, 0.0] },
+                        "g": {
+                            "p": 2,
+                            "k": {
+                                "a": 0,
+                                "k": [
+                                    0.0, 1.0, 1.0, 1.0,
+                                    1.0, 0.0, 0.0, 0.0
+                                ]
+                            }
+                        },
+                        "o": { "k": 100.0 },
+                        "w": { "k": 3.0 }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let stroke = content.groups[0].stroke.as_ref().expect("gradient stroke parsed");
+        assert!(matches!(stroke.paint, Paint::RadialGradient { .. }));
+        assert!((stroke.width.sample(0.0) - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gradient_alpha_stops_merge_into_color_alpha() {
+        // Two color stops + two alpha stops at matching offsets.
+        // Expectation: per-stop alpha from the alpha tail overrides
+        // the default 1.0.
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "gf",
+                        "t": 1,
+                        "s": { "k": [0.0, 0.0] },
+                        "e": { "k": [100.0, 0.0] },
+                        "g": {
+                            "p": 2,
+                            "k": {
+                                "a": 0,
+                                "k": [
+                                    0.0, 1.0, 0.0, 0.0,
+                                    1.0, 0.0, 0.0, 1.0,
+                                    0.0, 0.25,
+                                    1.0, 0.75
+                                ]
+                            }
+                        },
+                        "o": { "k": 100.0 }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let fill = content.groups[0].fill.as_ref().unwrap();
+        let Paint::LinearGradient { stops, .. } = &fill.paint else {
+            panic!("expected linear gradient");
+        };
+        assert!((stops[0].color[3] - 0.25).abs() < 1e-5);
+        assert!((stops[1].color[3] - 0.75).abs() < 1e-5);
     }
 }
