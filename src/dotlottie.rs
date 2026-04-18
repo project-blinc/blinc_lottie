@@ -1,56 +1,139 @@
-//! `.lottie` archive decoder.
+//! `.lottie` archive decoder per [dotLottie 2.0 spec](https://dotlottie.io/spec/2.0/).
 //!
-//! dotLottie is a zip archive standardized by the LottieFiles community
-//! for distributing Lottie animations with bundled assets. Layout (from
-//! the [dotLottie 2.0 spec](https://dotlottie.io/spec/2.0/)):
+//! Archive layout:
 //!
 //! ```text
-//! <archive>.lottie
-//! ├── manifest.json          (optional — describes bundled animations)
-//! ├── animations/            (multi-animation case)
-//! │   ├── anim_1.json
-//! │   └── anim_2.json
-//! ├── <name>.json            (single-animation case, at archive root)
-//! ├── state_machine.json     (optional — state machine spec)
-//! ├── state_machines/        (multi-SM case)
-//! │   └── sm_1.json
-//! └── images/                (optional — raster assets)
-//!     └── img_0.png
+//! <file>.lottie (zip, Deflate)
+//! ├── manifest.json       (required) — animations[]/stateMachines[]/initial
+//! ├── a/                  (required) — `<id>.json` per animation
+//! │   └── <anim_id>.json
+//! ├── s/                  (optional) — `<id>.json` per state machine
+//! │   └── <sm_id>.json
+//! ├── i/                  (optional) — image assets
+//! ├── f/                  (optional) — font assets
+//! └── t/                  (optional) — theme JSONs
 //! ```
 //!
-//! This module stays deliberately minimal: no manifest parsing, no
-//! image extraction, no multi-animation support. Returns the first
-//! JSON file that looks like a Lottie animation plus the first
-//! state-machine JSON if one is present. Covers the common case
-//! (single-animation archive) and leaves the richer variants for
-//! follow-ups that land alongside Phase 4's image-layer work.
+//! This module reads `manifest.json`, resolves the initial animation
+//! and state machine (or the first declared entries when `initial`
+//! isn't set), and returns their raw JSON bytes.
 //!
-//! Compiled only when the `dotlottie` feature is enabled; consumers
-//! that ship plain JSON Lotties don't pull in the `zip` crate.
+//! Image / font / theme assets are not yet extracted — raster layers
+//! referencing `i/` will skip with their default until Phase 4's
+//! image-layer work wires the asset pass-through.
+//!
+//! Compiled only under the `dotlottie` feature.
 #![cfg(feature = "dotlottie")]
 
-use std::io::Cursor;
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
+
+use serde::Deserialize;
 
 use crate::Error;
 
-/// Decode a `.lottie` archive and return `(animation_json,
-/// state_machine_json)`. State machine JSON is `None` when the
-/// archive doesn't include one.
+/// The decoded contents of a `.lottie` archive. Only the pieces we
+/// currently consume — manifest header + raw JSON bytes keyed by
+/// the ID they get in the manifest. Future work (images, fonts,
+/// themes) layers by adding fields here.
+pub(crate) struct DotLottieArchive {
+    pub manifest: Manifest,
+    /// Animation JSON bytes keyed by `id` (matches the directory
+    /// entry `a/<id>.json`).
+    pub animations: HashMap<String, Vec<u8>>,
+    /// State-machine JSON bytes keyed by `id` (matches `s/<id>.json`).
+    pub state_machines: HashMap<String, Vec<u8>>,
+}
+
+impl DotLottieArchive {
+    /// Animation the manifest designated as initial, else the first
+    /// entry in declaration order. `None` only when the manifest's
+    /// `animations` array was empty, which the spec forbids but we
+    /// accept rather than reject — for robustness against
+    /// hand-crafted archives and asset-stripping tools.
+    pub fn initial_animation(&self) -> Option<&[u8]> {
+        let id = self
+            .manifest
+            .initial
+            .as_ref()
+            .and_then(|i| i.animation.as_deref())
+            .or_else(|| self.manifest.animations.first().map(|m| m.id.as_str()))?;
+        self.animations.get(id).map(Vec::as_slice)
+    }
+
+    /// State machine the manifest designated as initial, else the
+    /// first entry in declaration order. `None` when the archive
+    /// doesn't carry any state-machine definitions.
+    pub fn initial_state_machine(&self) -> Option<&[u8]> {
+        let id = self
+            .manifest
+            .initial
+            .as_ref()
+            .and_then(|i| i.state_machine.as_deref())
+            .or_else(|| {
+                self.manifest
+                    .state_machines
+                    .first()
+                    .map(|m| m.id.as_str())
+            })?;
+        self.state_machines.get(id).map(Vec::as_slice)
+    }
+}
+
+/// Deserialized `manifest.json`. Extra fields (generator, themes,
+/// per-animation metadata like `initialTheme` / `background`) parse
+/// but aren't surfaced — the Player doesn't consume them yet.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Manifest {
+    #[allow(dead_code)]
+    pub version: String,
+    pub animations: Vec<AnimationMeta>,
+    #[serde(rename = "stateMachines", default)]
+    pub state_machines: Vec<StateMachineMeta>,
+    #[serde(default)]
+    pub initial: Option<InitialSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AnimationMeta {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StateMachineMeta {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct InitialSpec {
+    #[serde(default)]
+    pub animation: Option<String>,
+    #[serde(rename = "stateMachine", default)]
+    pub state_machine: Option<String>,
+}
+
+/// Decode a `.lottie` archive against the 2.0 spec layout. Returns
+/// the manifest header + raw JSON bodies for every declared
+/// animation and state machine.
 ///
-/// Behaviour on malformed / missing entries:
-/// - zip parse failure → `Error::Archive`
-/// - no animation JSON → `Error::Archive`
-/// - present but unreadable state_machine → treated as `None` and
-///   parsing continues (state machine is optional; we don't want
-///   a malformed SM to block the main animation)
-pub(crate) fn extract_archive(src: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), Error> {
+/// Errors:
+/// - Non-zip input or zip parse failure → `Error::Archive`.
+/// - Missing `manifest.json` → `Error::Archive` (required by spec).
+/// - Malformed `manifest.json` JSON → `Error::Json`.
+/// - Manifest declares an animation whose file isn't in `a/` →
+///   `Error::Archive`. State-machine misses are tolerated
+///   silently (the archive is still considered valid — missing SM
+///   just means the player can't run it).
+pub(crate) fn extract(src: &[u8]) -> Result<DotLottieArchive, Error> {
     let reader = Cursor::new(src);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| Error::Archive(format!("not a valid zip: {e}")))?;
 
-    let mut animation: Option<Vec<u8>> = None;
-    let mut state_machine: Option<Vec<u8>> = None;
+    // Bucket raw entries keyed by archive path. Loading into memory
+    // up-front so we can walk `manifest.json` twice without
+    // re-seeking — archive sizes are small enough (a few MB for
+    // real-world icon packs) that the extra allocation is fine.
+    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -59,43 +142,68 @@ pub(crate) fn extract_archive(src: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), 
             continue;
         }
         let name = entry.name().to_string();
-        let lower = name.to_ascii_lowercase();
-        // State-machine JSON takes priority when the filename
-        // matches, otherwise anything ending in .json inside the
-        // state_machines/ directory. First hit wins — matches the
-        // single-SM convention.
-        let is_state_machine = lower.ends_with("state_machine.json")
-            || lower.starts_with("state_machines/")
-            || lower.contains("/state_machines/");
-        if is_state_machine && state_machine.is_none() {
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry
-                .read_to_end(&mut buf)
-                .map_err(|e| Error::Archive(format!("read state_machine: {e}")))?;
-            state_machine = Some(buf);
-            continue;
-        }
-        // Accept `animation.json` at root, or any `.json` in
-        // `animations/`, or a bare `<name>.json` at archive root.
-        // Skip manifest and state_machine, which we handle above.
-        let is_animation = (lower.ends_with(".json")
-            && !lower.ends_with("manifest.json")
-            && !is_state_machine)
-            && (!lower.contains('/') || lower.starts_with("animations/"));
-        if is_animation && animation.is_none() {
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry
-                .read_to_end(&mut buf)
-                .map_err(|e| Error::Archive(format!("read animation: {e}")))?;
-            animation = Some(buf);
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::Archive(format!("read {name}: {e}")))?;
+        files.insert(name, buf);
+    }
+
+    let manifest_bytes = files
+        .get("manifest.json")
+        .ok_or_else(|| Error::Archive("manifest.json missing from archive root".to_string()))?;
+    let manifest: Manifest = serde_json::from_slice(manifest_bytes)?;
+
+    // Pull every declared animation. An animation listed in the
+    // manifest but missing its `a/<id>.json` file is a genuine
+    // archive error — the spec requires every `animations[]` entry
+    // to have a corresponding file.
+    let mut animations: HashMap<String, Vec<u8>> = HashMap::new();
+    for meta in &manifest.animations {
+        let path = format!("a/{}.json", meta.id);
+        let bytes = files.get(&path).ok_or_else(|| {
+            Error::Archive(format!(
+                "animation '{}' declared in manifest but `{}` missing",
+                meta.id, path
+            ))
+        })?;
+        animations.insert(meta.id.clone(), bytes.clone());
+    }
+
+    // State machines are optional even when declared — some tools
+    // emit manifest entries before authoring the SM. Warn via
+    // omission rather than erroring so partial archives still play.
+    let mut state_machines: HashMap<String, Vec<u8>> = HashMap::new();
+    for meta in &manifest.state_machines {
+        let path = format!("s/{}.json", meta.id);
+        if let Some(bytes) = files.get(&path) {
+            state_machines.insert(meta.id.clone(), bytes.clone());
         }
     }
 
-    match animation {
-        Some(bytes) => Ok((bytes, state_machine)),
-        None => Err(Error::Archive(
-            "no animation JSON found in archive".to_string(),
-        )),
+    Ok(DotLottieArchive {
+        manifest,
+        animations,
+        state_machines,
+    })
+}
+
+// Debug impl for test panic messages and `#[debug]` assertions.
+// The public API is the opaque `DotLottieArchive` struct above —
+// `{:?}` prints manifest + the list of animation / state-machine
+// IDs, not the raw JSON bytes, so asset-heavy archives stay
+// legible in logs.
+#[allow(dead_code)]
+impl std::fmt::Debug for DotLottieArchive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DotLottieArchive")
+            .field("manifest", &self.manifest)
+            .field("animations", &self.animations.keys().collect::<Vec<_>>())
+            .field(
+                "state_machines",
+                &self.state_machines.keys().collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -122,45 +230,89 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn extracts_single_root_json() {
-        let archive = make_archive(&[("animation.json", b"{\"v\":\"5.0\"}")]);
-        let (anim, sm) = extract_archive(&archive).unwrap();
-        assert_eq!(anim, b"{\"v\":\"5.0\"}");
-        assert!(sm.is_none());
+    fn minimal_anim() -> &'static [u8] {
+        br#"{"v":"5.0","fr":60,"ip":0,"op":60,"w":100,"h":100,"layers":[]}"#
     }
 
     #[test]
-    fn extracts_animation_plus_state_machine() {
+    fn extracts_animation_via_manifest_id() {
+        let manifest = br#"{"version":"2","animations":[{"id":"main"}]}"#;
         let archive = make_archive(&[
-            ("animation.json", b"{\"v\":\"5.0\"}"),
-            ("state_machine.json", b"{\"states\":[]}"),
+            ("manifest.json", manifest),
+            ("a/main.json", minimal_anim()),
         ]);
-        let (anim, sm) = extract_archive(&archive).unwrap();
-        assert_eq!(anim, b"{\"v\":\"5.0\"}");
-        assert_eq!(sm.as_deref(), Some(b"{\"states\":[]}" as &[u8]));
+        let decoded = extract(&archive).unwrap();
+        assert_eq!(decoded.manifest.version, "2");
+        assert_eq!(decoded.animations.len(), 1);
+        assert!(decoded.animations.contains_key("main"));
+        assert_eq!(decoded.initial_animation(), Some(minimal_anim()));
     }
 
     #[test]
-    fn picks_animation_from_animations_directory() {
+    fn extracts_multiple_animations_and_state_machines() {
+        let manifest = br#"{
+            "version": "2",
+            "animations": [{"id": "idle"}, {"id": "hover"}],
+            "stateMachines": [{"id": "interaction"}],
+            "initial": { "animation": "hover", "stateMachine": "interaction" }
+        }"#;
         let archive = make_archive(&[
-            ("manifest.json", b"{}"),
-            ("animations/main.json", b"{\"v\":\"5.0\"}"),
+            ("manifest.json", manifest),
+            ("a/idle.json", minimal_anim()),
+            ("a/hover.json", minimal_anim()),
+            ("s/interaction.json", br#"{"initial":"x","states":[]}"#),
         ]);
-        let (anim, _) = extract_archive(&archive).unwrap();
-        assert_eq!(anim, b"{\"v\":\"5.0\"}");
+        let decoded = extract(&archive).unwrap();
+        assert_eq!(decoded.animations.len(), 2);
+        assert_eq!(decoded.state_machines.len(), 1);
+        // Initial honors the manifest override — not the declaration order.
+        assert!(decoded.initial_animation().is_some());
+        assert!(decoded.initial_state_machine().is_some());
     }
 
     #[test]
-    fn missing_animation_surfaces_archive_error() {
-        let archive = make_archive(&[("manifest.json", b"{}")]);
-        let err = extract_archive(&archive).unwrap_err();
-        assert!(matches!(err, Error::Archive(_)));
+    fn missing_manifest_is_an_error() {
+        let archive = make_archive(&[("a/main.json", minimal_anim())]);
+        match extract(&archive) {
+            Err(Error::Archive(_)) => {}
+            other => panic!("expected Archive error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn non_zip_input_surfaces_archive_error() {
-        let err = extract_archive(b"not a zip").unwrap_err();
-        assert!(matches!(err, Error::Archive(_)));
+    fn manifest_animation_without_file_is_an_error() {
+        let manifest = br#"{"version":"2","animations":[{"id":"ghost"}]}"#;
+        let archive = make_archive(&[("manifest.json", manifest)]);
+        match extract(&archive) {
+            Err(Error::Archive(msg)) => assert!(msg.contains("ghost")),
+            other => panic!("expected Archive error about missing file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_zip_input_is_an_error() {
+        match extract(b"not a zip") {
+            Err(Error::Archive(_)) => {}
+            other => panic!("expected Archive error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_machine_declared_but_file_missing_is_tolerated() {
+        // Spec requires declared animations exist but doesn't strictly
+        // require declared state machines to — we surface this as
+        // "no state machine present" rather than a hard error.
+        let manifest = br#"{
+            "version": "2",
+            "animations": [{"id": "a"}],
+            "stateMachines": [{"id": "missing"}]
+        }"#;
+        let archive = make_archive(&[
+            ("manifest.json", manifest),
+            ("a/a.json", minimal_anim()),
+        ]);
+        let decoded = extract(&archive).unwrap();
+        assert!(decoded.state_machines.is_empty());
+        assert!(decoded.initial_state_machine().is_none());
     }
 }

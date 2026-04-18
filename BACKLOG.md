@@ -145,32 +145,48 @@ it.
 
 ## Phase 5 — Format + performance
 
-- [x] **dotLottie (`.lottie`)** — shipped in the same cycle as
-  state machines. `from_dotlottie_bytes(&[u8])` unpacks the zip,
-  returns `(animation_json, state_machine_json)`, and
-  `LottiePlayer::from_dotlottie_bytes` plugs into the existing
-  load path. Image-asset extraction is deferred; archives that
-  reference rasters via `assets[].p` render the vector content
-  correctly and skip the raster layers until Phase 4's image-
-  layer work lands.
+- [x] **dotLottie (`.lottie`)** — shipped, spec-2.0 layout.
+  `DotLottieArchive` extracts `manifest.json` + `a/<id>.json` +
+  `s/<id>.json`, honouring `manifest.initial.{animation,stateMachine}`.
+  `LottiePlayer::from_dotlottie_bytes` resolves the initial animation
+  through that path. Image / font / theme directories (`i/`, `f/`, `t/`)
+  are parsed into the archive but not yet surfaced — raster layers that
+  reference `i/` render vector content and skip the raster layer until
+  Phase 4's image-layer work lands. Reference:
+  <https://dotlottie.io/spec/2.0/>.
 
-- [x] **dotLottie state machines** — shipped.
-  `LottieStateMachine::from_dotlottie_bytes` decodes
-  `state_machine.json` into a [`blinc_core::fsm::StateMachine`] so
-  transitions reuse the framework FSM primitive. States carry a
-  `segment: (start, end)` in seconds; `LottiePlayer::play_segment`
-  constrains the sketch-clock wrap to that window, seeks on every
-  transition so the new pose enters at its authored first frame.
+- [x] **dotLottie state machines** — shipped, spec-2.0 subset.
+  `LottieStateMachine::from_dotlottie_bytes` decodes `s/<id>.json`
+  (tagged `PlaybackState` / `GlobalState` entries, nested
+  `Transition` / `Tweened` arrays, `Event` / `Numeric` / `String` /
+  `Boolean` guards) into a [`blinc_core::fsm::StateMachine`] so
+  transitions reuse the framework FSM primitive. Frame-based
+  `segment: [start, end]` values are converted to seconds at load
+  using `LottiePlayer::frame_rate`; `play_segment` / `clear_segment`
+  on the player constrain the sketch-clock wrap. Scoped subset (see
+  `state_machine.rs` module docs for the full matrix):
+  - **Applied**: PlaybackState + GlobalState, `segment`, immediate
+    `Transition`, `Event` guards (fire on `send(input_name)`),
+    `GlobalState` transitions expanded over every other state so
+    they fire from any source state.
+  - **Parsed, no-op**: `Tweened` transitions fire immediately
+    (duration + easing ignored); non-`Event` guards always pass;
+    `actions`, `interactions`, `inputs`; per-state `loop`,
+    `loopCount`, `speed`, `autoplay`; `mode` other than Forward.
+
   Follow-ups still on the table:
-  - Per-state `loop: bool` (all segments loop today).
-  - Per-state playback speed multiplier.
-  - Guard closures + triggered actions (Blinc's FSM supports them
-    natively — just wire through from the schema when assets start
-    using them).
+  - Tween duration + easing (`Tweened` currently downgrades to
+    immediate — crossfades between segments are the primary
+    visual gap).
+  - Numeric / String / Boolean guards driven by an input store
+    exposed via `send_numeric` / `send_string` / `send_boolean`.
+  - `actions` execution (`fire` / `reset` / `toggle` / `setNumeric`
+    / `setString` / `setBoolean`).
+  - Per-state playback modifiers: `loop: false`, `loopCount`,
+    `speed`, `Reverse` / `Bounce` / `ReverseBounce` modes.
   - Animated-segment markers (`"marker": "<name>"` pointing at a
-    Lottie marker instead of explicit `(start, end)`).
+    Lottie marker instead of explicit `[start, end]` frames).
   - Image-asset extraction from the archive for raster layers.
-  - Reference: <https://dotlottie.io/spec/2.0/>.
 
 - [ ] **Keyframe lookup acceleration**
   - **Why:** `sample_*` does a linear scan per property per frame. Fine

@@ -110,23 +110,29 @@ impl LottiePlayer {
         Ok(Self::from_root(root))
     }
 
-    /// Parse a `.lottie` (dotLottie) archive into a player.
+    /// Parse a `.lottie` (dotLottie 2.0) archive into a player.
     ///
-    /// A dotLottie archive is a zip with at least `animation.json`
-    /// (or a single `.json` entry) at its root plus optional image
-    /// assets and `state_machine.json`. This loader extracts only
-    /// the main animation JSON; callers wanting the state machine
-    /// should use [`crate::state_machine::LottieStateMachine::from_dotlottie_bytes`]
-    /// instead (which also returns the underlying player).
+    /// The archive layout follows the [spec](https://dotlottie.io/spec/2.0/):
+    /// `manifest.json` at the root enumerates animations (under `a/`)
+    /// and optional state machines (under `s/`). This loader resolves
+    /// the manifest's `initial.animation` (falling back to the first
+    /// declared animation) and parses that into a player.
     ///
-    /// Image-asset unpacking is still TODO — `.lottie` files that
-    /// reference external images via `assets[].p` will render the
-    /// vector content correctly but skip raster layers. Image
-    /// support lands alongside Phase 4's image-layer work.
+    /// Callers that also want the state machine should use
+    /// [`crate::state_machine::LottieStateMachine::from_dotlottie_bytes`]
+    /// instead — it returns the player alongside the FSM.
+    ///
+    /// Image / font / theme assets (`i/`, `f/`, `t/`) are parsed into
+    /// the archive but not yet surfaced. Scenes whose raster layers
+    /// reference `i/` will render vector content correctly and skip
+    /// the raster layers until the Phase 4 image-layer work lands.
     #[cfg(feature = "dotlottie")]
     pub fn from_dotlottie_bytes(src: &[u8]) -> Result<Self, Error> {
-        let (animation_json, _) = crate::dotlottie::extract_archive(src)?;
-        Self::from_bytes(&animation_json)
+        let archive = crate::dotlottie::extract(src)?;
+        let animation_bytes = archive
+            .initial_animation()
+            .ok_or_else(|| Error::Archive("archive declares no animations".to_string()))?;
+        Self::from_bytes(animation_bytes)
     }
 
     fn from_root(root: parser::LottieRoot) -> Self {
@@ -166,6 +172,14 @@ impl LottiePlayer {
     /// Scene's intrinsic height in pixels (from the Lottie header).
     pub fn source_height(&self) -> u32 {
         self.root.height
+    }
+
+    /// Composition frame rate (from the Lottie `fr` field). Used by
+    /// [`crate::state_machine::LottieStateMachine`] to convert
+    /// frame-based segments from dotLottie state-machine JSON into
+    /// the seconds-based timeline the player consumes.
+    pub fn frame_rate(&self) -> f32 {
+        self.root.frame_rate.max(1.0)
     }
 
     /// Number of layers in the scene. Useful for smoke-testing that a
