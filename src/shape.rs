@@ -34,7 +34,7 @@
 //! simpler single-fill / single-stroke per group model — covers the
 //! vast majority of motion-design exports and stays readable.
 
-use blinc_core::draw::{Path, Stroke};
+use blinc_core::draw::{LineCap, LineJoin, Path, Stroke};
 use blinc_core::layer::{Brush, Color, CornerRadius, Rect};
 use blinc_core::DrawContext;
 use serde_json::Value;
@@ -307,6 +307,31 @@ struct StrokeSpec {
     opacity: AnimatedF32,
     /// Line width in source-space pixels.
     width: AnimatedF32,
+    /// Endpoint cap style (Lottie `lc`: 1 = butt, 2 = round,
+    /// 3 = square). Defaults to `Butt` to match the glTF /
+    /// SVG/Lottie spec default.
+    cap: LineCap,
+    /// Corner join style (Lottie `lj`: 1 = miter, 2 = round,
+    /// 3 = bevel).
+    join: LineJoin,
+    /// Miter-limit ratio (Lottie `ml` — default 4.0). Only
+    /// meaningful with `LineJoin::Miter`; sharp corners past
+    /// this ratio degrade to bevels to avoid spiking.
+    miter_limit: f32,
+    /// Dash / gap cycle in source-space units. Empty = solid line.
+    /// Lottie's `st.d` is an array of `{ n: "d"/"g"/"o", v: {k} }`
+    /// entries; alternating `d`/`g` values concatenate into this
+    /// flat `[d, g, d, g, ...]` pattern that matches how the
+    /// Blinc [`Stroke`] builder consumes it.
+    ///
+    /// Parsed static — animating individual dash lengths is rare
+    /// enough that the data-shape cost (per-segment keyframe
+    /// arrays) isn't worth it until a real asset needs it.
+    dash_pattern: Vec<f32>,
+    /// Dash offset (Lottie `st.d` entry with `n: "o"`). Animatable
+    /// because the "marching ants" effect (offset ramped linearly)
+    /// is the canonical use case.
+    dash_offset: AnimatedF32,
 }
 
 impl ShapeContent {
@@ -362,7 +387,17 @@ impl ShapeGroup {
                 let width = stroke.width.sample(t).max(0.0);
                 if width > 0.0 {
                     let brush = sample_paint_brush(&stroke.paint, &stroke.opacity, t);
-                    dc.stroke_path(&path, &Stroke::new(width), brush);
+                    let mut builder = Stroke::new(width)
+                        .with_cap(stroke.cap)
+                        .with_join(stroke.join);
+                    builder.miter_limit = stroke.miter_limit;
+                    if !stroke.dash_pattern.is_empty() {
+                        builder = builder.with_dash(
+                            stroke.dash_pattern.clone(),
+                            stroke.dash_offset.sample(t),
+                        );
+                    }
+                    dc.stroke_path(&path, &builder, brush);
                 }
             }
         }
@@ -664,6 +699,7 @@ fn parse_fill(v: &Value, fr: f32) -> FillSpec {
 }
 
 fn parse_stroke(v: &Value, fr: f32) -> StrokeSpec {
+    let (dash_pattern, dash_offset) = parse_dash(v, fr);
     StrokeSpec {
         paint: Paint::Solid(
             parse_animated_vec4(v.get("c"), fr)
@@ -671,6 +707,15 @@ fn parse_stroke(v: &Value, fr: f32) -> StrokeSpec {
         ),
         opacity: parse_opacity(v, fr),
         width: parse_animated_scalar(v.get("w"), fr).unwrap_or(AnimatedF32::Static(1.0)),
+        cap: parse_line_cap(v.get("lc")),
+        join: parse_line_join(v.get("lj")),
+        miter_limit: v
+            .get("ml")
+            .and_then(Value::as_f64)
+            .map(|n| n as f32)
+            .unwrap_or(4.0),
+        dash_pattern,
+        dash_offset,
     }
 }
 
@@ -697,11 +742,80 @@ fn parse_gradient_fill(v: &Value, fr: f32) -> FillSpec {
 }
 
 fn parse_gradient_stroke(v: &Value, fr: f32) -> StrokeSpec {
+    let (dash_pattern, dash_offset) = parse_dash(v, fr);
     StrokeSpec {
         paint: parse_gradient_paint(v, fr),
         opacity: parse_opacity(v, fr),
         width: parse_animated_scalar(v.get("w"), fr).unwrap_or(AnimatedF32::Static(1.0)),
+        cap: parse_line_cap(v.get("lc")),
+        join: parse_line_join(v.get("lj")),
+        miter_limit: v
+            .get("ml")
+            .and_then(Value::as_f64)
+            .map(|n| n as f32)
+            .unwrap_or(4.0),
+        dash_pattern,
+        dash_offset,
     }
+}
+
+/// Lottie line-cap enum: 1 = butt, 2 = round, 3 = square. Any
+/// unrecognised value (including absent field) maps to `Butt`,
+/// matching the spec default.
+fn parse_line_cap(v: Option<&Value>) -> LineCap {
+    match v.and_then(Value::as_u64) {
+        Some(2) => LineCap::Round,
+        Some(3) => LineCap::Square,
+        _ => LineCap::Butt,
+    }
+}
+
+/// Lottie line-join enum: 1 = miter, 2 = round, 3 = bevel.
+fn parse_line_join(v: Option<&Value>) -> LineJoin {
+    match v.and_then(Value::as_u64) {
+        Some(2) => LineJoin::Round,
+        Some(3) => LineJoin::Bevel,
+        _ => LineJoin::Miter,
+    }
+}
+
+/// Parse a Lottie `st.d` / `gs.d` array into a flat dash pattern
+/// (`[d, g, d, g, ...]`) plus a separate offset. Each element is
+/// an object `{ n: "d"|"g"|"o", v: { k: <num_or_keyframes> } }`.
+///
+/// Dash / gap values are sampled at `t = 0` (static). Offset
+/// stays animatable for the "marching ants" case. When the array
+/// is absent or malformed the returned pattern is empty — Blinc's
+/// [`Stroke`] treats empty dash as a solid line.
+fn parse_dash(v: &Value, fr: f32) -> (Vec<f32>, AnimatedF32) {
+    let Some(arr) = v.get("d").and_then(Value::as_array) else {
+        return (Vec::new(), AnimatedF32::Static(0.0));
+    };
+    let mut pattern = Vec::new();
+    let mut offset = AnimatedF32::Static(0.0);
+    for entry in arr {
+        let name = entry.get("n").and_then(Value::as_str).unwrap_or("");
+        let value = parse_animated_scalar(entry.get("v"), fr);
+        match name {
+            "d" | "g" => {
+                // Sample at the animation's start; `AnimatedF32`
+                // with no keyframes resolves to a constant anyway.
+                // Animating individual dash lengths per-frame
+                // would need a re-alloc of the dash `Vec<f32>`
+                // every sample tick — not worth it for this cut.
+                if let Some(v) = value {
+                    pattern.push(v.sample(0.0).max(0.0));
+                }
+            }
+            "o" => {
+                if let Some(v) = value {
+                    offset = v;
+                }
+            }
+            _ => {}
+        }
+    }
+    (pattern, offset)
 }
 
 fn parse_gradient_paint(v: &Value, fr: f32) -> Paint {
@@ -1153,6 +1267,134 @@ mod tests {
         let stroke = content.groups[0].stroke.as_ref().expect("gradient stroke parsed");
         assert!(matches!(stroke.paint, Paint::RadialGradient { .. }));
         assert!((stroke.width.sample(0.0) - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_stroke_cap_join_and_miter_limit() {
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "st",
+                        "c": { "k": [0.0, 0.0, 0.0, 1.0] },
+                        "o": { "k": 100.0 },
+                        "w": { "k": 2.0 },
+                        "lc": 2,  // round
+                        "lj": 3,  // bevel
+                        "ml": 10.0
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        assert_eq!(stroke.cap, LineCap::Round);
+        assert_eq!(stroke.join, LineJoin::Bevel);
+        assert!((stroke.miter_limit - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_dash_pattern_with_offset() {
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "st",
+                        "c": { "k": [0.0, 0.0, 0.0, 1.0] },
+                        "o": { "k": 100.0 },
+                        "w": { "k": 2.0 },
+                        "d": [
+                            { "n": "d", "v": { "k": 10.0 } },
+                            { "n": "g", "v": { "k": 5.0 } },
+                            { "n": "o", "v": { "k": 3.0 } }
+                        ]
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        assert_eq!(stroke.dash_pattern, vec![10.0, 5.0]);
+        assert!((stroke.dash_offset.sample(0.0) - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_multi_stride_dash_pattern() {
+        // Lottie can encode patterns like "dash 10, gap 5, dash 20,
+        // gap 3" as four d/g entries — they concatenate into a
+        // single `[10, 5, 20, 3]` cycle that Blinc's `Stroke`
+        // consumes directly.
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "st",
+                        "c": { "k": [0.0, 0.0, 0.0, 1.0] },
+                        "o": { "k": 100.0 },
+                        "w": { "k": 2.0 },
+                        "d": [
+                            { "n": "d", "v": { "k": 10.0 } },
+                            { "n": "g", "v": { "k": 5.0 } },
+                            { "n": "d", "v": { "k": 20.0 } },
+                            { "n": "g", "v": { "k": 3.0 } }
+                        ]
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        assert_eq!(stroke.dash_pattern, vec![10.0, 5.0, 20.0, 3.0]);
+    }
+
+    #[test]
+    fn stroke_without_style_fields_uses_defaults() {
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "st",
+                        "c": { "k": [0.0, 0.0, 0.0, 1.0] },
+                        "o": { "k": 100.0 },
+                        "w": { "k": 2.0 }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        assert_eq!(stroke.cap, LineCap::Butt);
+        assert_eq!(stroke.join, LineJoin::Miter);
+        assert!((stroke.miter_limit - 4.0).abs() < 1e-5);
+        assert!(stroke.dash_pattern.is_empty());
     }
 
     #[test]
