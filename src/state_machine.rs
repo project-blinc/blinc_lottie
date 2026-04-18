@@ -86,6 +86,17 @@ struct StateMachineSpec {
     interactions: Vec<serde_json::Value>,
 }
 
+/// Either a literal `[startFrame, endFrame]` pair or a marker
+/// name the loader resolves against the animation's `markers`
+/// array. The untagged form matches both JSON shapes seen in
+/// the wild: `"segment": [0, 60]` and `"segment": "entry"`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SegmentSpec {
+    Frames([f32; 2]),
+    Marker(String),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum InputSpec {
@@ -117,7 +128,13 @@ struct PlaybackStateSpec {
     #[allow(dead_code)]
     animation: Option<String>,
     #[serde(default)]
-    segment: Option<[f32; 2]>,
+    segment: Option<SegmentSpec>,
+    /// Alternative `marker` field on PlaybackState entries — some
+    /// authoring tools emit the marker name here instead of
+    /// packing it into `segment`. When both are set, `segment`
+    /// wins; this is a fallback only.
+    #[serde(default)]
+    marker: Option<String>,
     #[serde(default, rename = "loop")]
     #[allow(dead_code)]
     r#loop: Option<bool>,
@@ -585,17 +602,43 @@ impl LottieStateMachine {
         let mut global_source_ids: Vec<StateId> = Vec::new();
 
         let mut state_playback: HashMap<StateId, StatePlayback> = HashMap::new();
+        // Build a name→(time, duration) lookup over the animation's
+        // markers so `SegmentSpec::Marker("name")` / `marker` fields
+        // can resolve into concrete seconds. Markers in the player
+        // are already seconds-relative; we reuse them verbatim.
+        let marker_table: HashMap<&str, (f32, f32)> = player
+            .markers()
+            .iter()
+            .map(|m| (m.name.as_str(), (m.time_seconds, m.duration_seconds)))
+            .collect();
         for (i, entry) in spec.states.iter().enumerate() {
             let id = i as StateId;
             let name = match entry {
                 StateEntry::PlaybackState(p) => {
-                    if let Some([start_f, end_f]) = p.segment {
-                        // Spec: `segment` is `[startFrame, endFrame]`.
-                        // Clamp start ≤ end so a swapped pair doesn't
-                        // produce a negative-length rem_euclid in
-                        // `play_segment`.
-                        let start_s = start_f / fr;
-                        let end_s = (end_f / fr).max(start_s);
+                    // Resolve the segment in seconds: explicit frame
+                    // pair wins, then `segment: "<marker>"`, then the
+                    // alternate `marker` field. A literal pair is
+                    // clamped to start ≤ end so a swapped authored
+                    // range can't produce a negative-length segment.
+                    // Marker misses fall through silently — the
+                    // state renders un-segmented, matching the
+                    // permissive-parse posture elsewhere.
+                    let resolved: Option<(f32, f32)> = match &p.segment {
+                        Some(SegmentSpec::Frames([start_f, end_f])) => {
+                            let start_s = start_f / fr;
+                            let end_s = (end_f / fr).max(start_s);
+                            Some((start_s, end_s))
+                        }
+                        Some(SegmentSpec::Marker(name)) => marker_table
+                            .get(name.as_str())
+                            .map(|(t, d)| (*t, *t + d.max(0.0))),
+                        None => p.marker.as_deref().and_then(|name| {
+                            marker_table
+                                .get(name)
+                                .map(|(t, d)| (*t, *t + d.max(0.0)))
+                        }),
+                    };
+                    if let Some((start_s, end_s)) = resolved {
                         state_segments.insert(id, (start_s, end_s));
                         // Compile per-state playback config alongside
                         // the segment. Defaults mirror the spec: loop
@@ -2205,6 +2248,63 @@ mod tests {
         ));
         // Unknown → fallback to Forward.
         assert!(matches!(PlaybackMode::from_str("wat"), PlaybackMode::Forward));
+    }
+
+    #[test]
+    fn marker_segment_resolves_to_time_plus_duration() {
+        // A Lottie with two markers: "entry" at 30f for 60f, "exit"
+        // at 120f for 60f. States referencing them via string
+        // should land on the equivalent seconds range (60fps →
+        // entry = 0.5→1.5s, exit = 2.0→3.0s).
+        let anim = r#"{
+            "v": "5.0", "fr": 60, "ip": 0, "op": 240,
+            "w": 100, "h": 100, "layers": [],
+            "markers": [
+                { "cm": "entry", "tm": 30,  "dr": 60 },
+                { "cm": "exit",  "tm": 120, "dr": 60 }
+            ]
+        }"#;
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "segment": "entry"
+                },
+                {
+                    "type": "PlaybackState", "name": "b", "animation": "main",
+                    "marker": "exit"
+                }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(anim).unwrap();
+        let sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert_eq!(sm.state_segments.get(&0), Some(&(0.5, 1.5)));
+        assert_eq!(sm.state_segments.get(&1), Some(&(2.0, 3.0)));
+    }
+
+    #[test]
+    fn missing_marker_name_leaves_state_unsegmented() {
+        // Unknown marker name falls through silently — no crash,
+        // no segment. The state just plays the composition's full
+        // timeline when active.
+        let anim = r#"{
+            "v": "5.0", "fr": 60, "ip": 0, "op": 120,
+            "w": 100, "h": 100, "layers": [],
+            "markers": []
+        }"#;
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "segment": "ghost"
+                }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(anim).unwrap();
+        let sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert!(!sm.state_segments.contains_key(&0));
     }
 
     #[test]

@@ -264,13 +264,18 @@ pub(crate) struct ScalarKey {
 }
 
 /// A single keyframe in a 2D vector property animation.
+/// Tangents are stored per-axis so position-style properties can
+/// ease X and Y independently when the author wants that. Both
+/// slots always hold the same value when the JSON uses the
+/// shared-tangent shape — `tangents_from_key_per_axis` folds the
+/// `{ x: 0.5, y: 0.0 }` form into `[Some(t), Some(t)]`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Vec2Key {
     pub t: f32,
     pub value: [f32; 2],
     pub hold: bool,
-    pub out_tangent: Option<BezierTangent>,
-    pub in_tangent: Option<BezierTangent>,
+    pub out_tangent: [Option<BezierTangent>; 2],
+    pub in_tangent: [Option<BezierTangent>; 2],
 }
 
 /// A scalar property that may be static or keyframed.
@@ -331,13 +336,15 @@ impl AnimatedVec2 {
 }
 
 /// A single keyframe in a 4D vector property animation (typically RGBA color).
+/// Tangents stored per-component; see [`Vec2Key`] for the shared-vs-per-axis
+/// folding convention.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Vec4Key {
     pub t: f32,
     pub value: [f32; 4],
     pub hold: bool,
-    pub out_tangent: Option<BezierTangent>,
-    pub in_tangent: Option<BezierTangent>,
+    pub out_tangent: [Option<BezierTangent>; 4],
+    pub in_tangent: [Option<BezierTangent>; 4],
 }
 
 /// A 4D vector property (e.g. RGBA color) that may be static or keyframed.
@@ -465,10 +472,16 @@ fn sample_vec2(keys: &[Vec2Key], t: f32) -> [f32; 2] {
                 return k0.value;
             }
             let linear_u = (t - k0.t) / (k1.t - k0.t);
-            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
+            // Per-axis ease: each component resolves its own
+            // bezier curve from the (k0.out[i], k1.in[i]) pair.
+            // Shared-curve keyframes fold to identical slots at
+            // parse time, so the per-axis path stays as fast as
+            // the shared one on that common input.
+            let ux = eased_u(linear_u, k0.out_tangent[0], k1.in_tangent[0]);
+            let uy = eased_u(linear_u, k0.out_tangent[1], k1.in_tangent[1]);
             return [
-                k0.value[0] + (k1.value[0] - k0.value[0]) * u,
-                k0.value[1] + (k1.value[1] - k0.value[1]) * u,
+                k0.value[0] + (k1.value[0] - k0.value[0]) * ux,
+                k0.value[1] + (k1.value[1] - k0.value[1]) * uy,
             ];
         }
     }
@@ -494,12 +507,17 @@ fn sample_vec4(keys: &[Vec4Key], t: f32) -> [f32; 4] {
                 return k0.value;
             }
             let linear_u = (t - k0.t) / (k1.t - k0.t);
-            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
+            // Per-component ease — see `sample_vec2` for the
+            // shared-vs-per-axis folding convention.
+            let u0 = eased_u(linear_u, k0.out_tangent[0], k1.in_tangent[0]);
+            let u1 = eased_u(linear_u, k0.out_tangent[1], k1.in_tangent[1]);
+            let u2 = eased_u(linear_u, k0.out_tangent[2], k1.in_tangent[2]);
+            let u3 = eased_u(linear_u, k0.out_tangent[3], k1.in_tangent[3]);
             return [
-                k0.value[0] + (k1.value[0] - k0.value[0]) * u,
-                k0.value[1] + (k1.value[1] - k0.value[1]) * u,
-                k0.value[2] + (k1.value[2] - k0.value[2]) * u,
-                k0.value[3] + (k1.value[3] - k0.value[3]) * u,
+                k0.value[0] + (k1.value[0] - k0.value[0]) * u0,
+                k0.value[1] + (k1.value[1] - k0.value[1]) * u1,
+                k0.value[2] + (k1.value[2] - k0.value[2]) * u2,
+                k0.value[3] + (k1.value[3] - k0.value[3]) * u3,
             ];
         }
     }
@@ -899,33 +917,74 @@ fn collect_vec4_keys(arr: &[Value], fr: f32) -> Vec<Vec4Key> {
                 t: t_frames / fr,
                 value,
                 hold,
-                out_tangent: tangent_from_key(kf, "o"),
-                in_tangent: tangent_from_key(kf, "i"),
+                out_tangent: tangents_from_key_per_axis::<4>(kf, "o"),
+                in_tangent: tangents_from_key_per_axis::<4>(kf, "i"),
             })
         })
         .collect()
 }
 
-/// Extract a `BezierTangent` from a keyframe's `i` or `o` block.
+/// Extract a single shared `BezierTangent` from a keyframe's `i`
+/// or `o` block. Used by `ScalarKey` (which has one axis of
+/// easing — itself). The multi-axis forms use
+/// [`tangents_from_key_per_axis`] instead.
 ///
 /// Lottie JSON stores each tangent as either `{ "x": <num>, "y": <num> }`
 /// (shared-axis easing) or `{ "x": [<num>, ...], "y": [<num>, ...] }`
-/// (per-component easing). We take the scalar form directly and the
-/// first array element for the array form — covers every ease
-/// After Effects' "Easy Ease" preset emits, plus manually-authored
-/// per-axis eases collapse cleanly to a single shared curve.
+/// (per-component easing). The scalar form parses directly; the
+/// array form takes the first element — that's the canonical
+/// "shared curve" pick that collapses all axes onto a single ease.
 pub(crate) fn tangent_from_key(kf: &Value, field: &str) -> Option<BezierTangent> {
     let obj = kf.get(field)?;
-    let x = scalar_or_first(obj.get("x")?)?;
-    let y = scalar_or_first(obj.get("y")?)?;
+    let x = scalar_or_nth(obj.get("x")?, 0)?;
+    let y = scalar_or_nth(obj.get("y")?, 0)?;
     Some(BezierTangent { x, y })
 }
 
-fn scalar_or_first(v: &Value) -> Option<f32> {
+/// Build an N-axis tangent array from a keyframe's `i` or `o` block.
+/// Each slot reads `x[idx]` / `y[idx]` when either is an array, else
+/// reuses the scalar form. Missing slots fall back to the axis-0
+/// tangent — matches the usual export where only one tangent is
+/// authored but the value is a multi-component vector.
+fn tangents_from_key_per_axis<const N: usize>(
+    kf: &Value,
+    field: &str,
+) -> [Option<BezierTangent>; N] {
+    let mut out: [Option<BezierTangent>; N] = [None; N];
+    let Some(obj) = kf.get(field) else {
+        return out;
+    };
+    let x_val = obj.get("x");
+    let y_val = obj.get("y");
+    let Some(x_val) = x_val else { return out };
+    let Some(y_val) = y_val else { return out };
+    // Axis-0 always draws from the scalar-or-first path so a
+    // keyframe with only `{ "x": 0.5, "y": 0.0 }` still produces
+    // a valid tangent.
+    let share_x = scalar_or_nth(x_val, 0);
+    let share_y = scalar_or_nth(y_val, 0);
+    let share = match (share_x, share_y) {
+        (Some(x), Some(y)) => Some(BezierTangent { x, y }),
+        _ => None,
+    };
+    for (i, slot) in out.iter_mut().enumerate() {
+        let xi = scalar_or_nth(x_val, i).or(share_x);
+        let yi = scalar_or_nth(y_val, i).or(share_y);
+        *slot = match (xi, yi) {
+            (Some(x), Some(y)) => Some(BezierTangent { x, y }),
+            _ => share,
+        };
+    }
+    out
+}
+
+fn scalar_or_nth(v: &Value, idx: usize) -> Option<f32> {
     if let Some(arr) = v.as_array() {
-        arr.first().and_then(Value::as_f64).map(|n| n as f32)
-    } else {
+        arr.get(idx).and_then(Value::as_f64).map(|n| n as f32)
+    } else if idx == 0 {
         v.as_f64().map(|n| n as f32)
+    } else {
+        None
     }
 }
 
@@ -980,8 +1039,8 @@ fn collect_vec2_keys(arr: &[Value], fr: f32) -> Vec<Vec2Key> {
                 t: t_frames / fr,
                 value,
                 hold,
-                out_tangent: tangent_from_key(kf, "o"),
-                in_tangent: tangent_from_key(kf, "i"),
+                out_tangent: tangents_from_key_per_axis::<2>(kf, "o"),
+                in_tangent: tangents_from_key_per_axis::<2>(kf, "i"),
             })
         })
         .collect()
@@ -1337,6 +1396,51 @@ mod tests {
         let mut layers = vec![Layer::from_value(&c, 60.0)];
         resolve_parent_chains(&mut layers);
         assert!(layers[0].parent_chain.is_empty());
+    }
+
+    #[test]
+    fn per_axis_bezier_eases_x_and_y_independently() {
+        // Vec2 keyframe pair going (0,0) → (100, 100). X axis uses
+        // an ease-in tangent (slow start), Y stays linear. At the
+        // quarter point, X should trail 25 but Y should land near
+        // 25 — proves per-axis tangents aren't being collapsed
+        // onto a shared curve.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 10.0, "sh": 10.0, "sc": "#000000",
+            "ks": {
+                "p": {
+                    "a": 1,
+                    "k": [
+                        {
+                            "t": 0,
+                            "s": [0.0, 0.0, 0.0],
+                            "o": { "x": [0.833, 0.0], "y": [0.0, 0.0] }
+                        },
+                        {
+                            "t": 60,
+                            "s": [100.0, 100.0, 0.0],
+                            "i": { "x": [1.0, 1.0], "y": [1.0, 1.0] }
+                        }
+                    ]
+                }
+            }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        let sampled = layer.transform.sample(0.25);
+        // X axis: slow start, quarter point trails linear 25.
+        assert!(
+            sampled.position[0] < 20.0,
+            "eased X should lag linear at quarter, got {}",
+            sampled.position[0]
+        );
+        // Y axis: linear tangent, quarter point ≈ 25.
+        assert!(
+            (sampled.position[1] - 25.0).abs() < 2.0,
+            "linear Y should be ≈ 25 at quarter, got {}",
+            sampled.position[1]
+        );
     }
 
     #[test]

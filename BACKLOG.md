@@ -24,13 +24,15 @@ it.
   eases per axis remains a follow-up (would require per-component
   `sample_*` rather than a shared `u`).
 
-- [ ] **Per-axis bezier easing**
-  - **Why:** Rare but authored for position animations where X and Y
-    ease independently. Current fold-to-shared-curve is a visible
-    difference from the source tool in those cases.
-  - **How:** `Vec2Key` / `Vec4Key` grow per-component tangents;
-    `sample_vec2` / `sample_vec4` call `eased_u` once per axis
-    rather than once per segment.
+- [x] **Per-axis bezier easing** — shipped. `Vec2Key` / `Vec4Key`
+  now carry `[Option<BezierTangent>; N]` per-component tangents.
+  `sample_vec2` / `sample_vec4` evaluate `eased_u` once per axis
+  from the per-component `(out[i], in[i])` pair. Shared-curve
+  inputs (the common case, `{ x: 0.5, y: 0.0 }` scalar form) fold
+  into identical slots at parse time via `tangents_from_key_per_axis`,
+  so the per-axis path runs as fast as the old shared path on
+  that input. Authored per-axis curves (`{ x: [0.833, 0.0], y: [0.0, 1.0] }`)
+  now resolve distinctly per component.
 
 ---
 
