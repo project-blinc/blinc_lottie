@@ -14,11 +14,19 @@ rust-version = "1.75"
 # evolves independently of Blinc's release cadence.
 
 [dependencies]
-# Path dep during local dev; pin to the crates.io version once published:
+# Pinned git deps on the Blinc upstream — same pattern as
+# blinc_gltf / blinc_skeleton / blinc_input. The `[patch]` block
+# below redirects to local paths for in-Blinc-workspace
+# development; downstream consumers resolve against the pinned
+# rev. Bump in lockstep with Blinc's `main` once a feature this
+# crate needs lands.
 #
-#   blinc_canvas_kit = "0.5"
-blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
-blinc_core = { path = "../../crates/blinc_core" }
+# Pin to the Blinc rev that carries all APIs this crate currently
+# consumes (`DrawContext`, `Path`, `Transform` from blinc_core;
+# `Sketch`/canvas helpers from blinc_canvas_kit). Update when new
+# crate functionality requires API additions upstream.
+blinc_canvas_kit = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b" }
+blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b" }
 
 # JSON parsing for Lottie's `.json` / `.lottie` (zipped JSON) format.
 serde = { version = "1.0", features = ["derive"] }
@@ -27,17 +35,16 @@ serde_json = "1.0"
 # Error plumbing.
 thiserror = "2.0"
 
-# Local-dev patch — mirrors the Blinc workspace root so indirect
-# git-rev deps (e.g. blinc_canvas_kit → blinc_input → old Blinc
-# `blinc_layout`) collapse onto the path-dep versions above.
-# Without this, a `capture_input` from the git-fetched
-# blinc_input resolves `DivInputExt: impl for Div` against a
-# *different* `Div` type than the path-dep blinc_layout exports,
-# producing "method not found in `blinc_layout::Div`" against
-# what looks like the right trait in scope.
+# Local-dev patch — matches Blinc's workspace root, so
+# `cargo check` from inside this crate uses the colocated Blinc
+# checkout at `../../` instead of fetching the pinned rev. Also
+# flattens transitive git-rev deps (e.g. blinc_canvas_kit →
+# blinc_input → old Blinc `blinc_layout`) onto the path-dep
+# versions so trait impls (e.g. `DivInputExt: impl for
+# blinc_layout::Div`) resolve against a single `Div` type.
 #
-# Drop this block when blinc_lottie moves to crates.io — published
-# semver resolution will unify versions on its own.
+# Drop this block when blinc_lottie moves to crates.io —
+# published semver resolution will unify versions on its own.
 [patch."https://github.com/project-blinc/Blinc.git"]
 blinc_core = { path = "../../crates/blinc_core" }
 blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }

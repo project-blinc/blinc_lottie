@@ -249,7 +249,7 @@ fn solve_bezier_ease(u: f32, out_p: BezierTangent, in_p: BezierTangent) -> f32 {
 /// Compute eased progress between consecutive keyframes.
 /// `linear_u` is `(t - k0.t) / (k1.t - k0.t)` ∈ `[0, 1]`.
 #[inline]
-fn eased_u(
+pub(crate) fn eased_u(
     linear_u: f32,
     k0_out: Option<BezierTangent>,
     k1_in: Option<BezierTangent>,
@@ -648,7 +648,7 @@ fn collect_vec4_keys(arr: &[Value], fr: f32) -> Vec<Vec4Key> {
 /// first array element for the array form — covers every ease
 /// After Effects' "Easy Ease" preset emits, plus manually-authored
 /// per-axis eases collapse cleanly to a single shared curve.
-fn tangent_from_key(kf: &Value, field: &str) -> Option<BezierTangent> {
+pub(crate) fn tangent_from_key(kf: &Value, field: &str) -> Option<BezierTangent> {
     let obj = kf.get(field)?;
     let x = scalar_or_first(obj.get("x")?)?;
     let y = scalar_or_first(obj.get("y")?)?;

@@ -9,13 +9,13 @@
 //! | `tr`        | Transform   | Group transform (anchor / pos / scale / …)  |
 //! | `rc`        | Rectangle   | Geometry — center, size, corner radius      |
 //! | `el`        | Ellipse     | Geometry — center, size                     |
+//! | `sh`        | Path        | Geometry — vertices + per-vertex tangents   |
 //! | `fl`        | Fill        | Solid color + opacity                       |
 //! | `st`        | Stroke      | Solid color + opacity + width               |
 //!
-//! Items not in the table parse as no-ops. Most notably **path (`sh`)**,
-//! **polystar (`sr`)**, **trim path (`tm`)**, and **gradient
-//! fill/stroke (`gf` / `gs`)** are deferred — see Phase 2 / 3 in the
-//! crate README.
+//! Items not in the table parse as no-ops. Most notably **polystar
+//! (`sr`)**, **trim path (`tm`)**, and **gradient fill/stroke
+//! (`gf` / `gs`)** are deferred — see Phase 2 / 3 in the crate README.
 //!
 //! # Render model
 //!
@@ -40,8 +40,9 @@ use blinc_core::DrawContext;
 use serde_json::Value;
 
 use crate::layer::{
-    parse_animated_scalar, parse_animated_vec2, parse_animated_vec4, pop_layer_transform,
-    push_layer_transform, AnimatedF32, AnimatedVec2, AnimatedVec4, TransformSpec,
+    eased_u, parse_animated_scalar, parse_animated_vec2, parse_animated_vec4, pop_layer_transform,
+    push_layer_transform, tangent_from_key, AnimatedF32, AnimatedVec2, AnimatedVec4, BezierTangent,
+    TransformSpec,
 };
 
 /// Top-level shape-layer content. Wraps the layer's `shapes` array as a
@@ -73,6 +74,180 @@ enum Geometry {
         position: AnimatedVec2,
         size: AnimatedVec2,
     },
+    /// `sh` path: hand-drawn logos, icons, organic forms. The core
+    /// shape is a list of vertices plus per-vertex `in`/`out`
+    /// tangent offsets — segment N→N+1 renders as a cubic bezier
+    /// whose control points are `v[N] + out[N]` and `v[N+1] + in[N+1]`.
+    Path(AnimatedPath),
+}
+
+/// A single closed-or-open cubic-bezier path sampled at one moment.
+/// Lottie's raw shape data: vertex positions + per-vertex tangent
+/// offsets stored **relative to the vertex**. The render path
+/// absolutifies them when emitting `cubic_to` control points.
+///
+/// Same `Vec<[f32; 2]>` length for all three arrays is a Lottie
+/// invariant — one `in` / `out` per vertex. If the JSON violates
+/// this the parser falls back to a single-point dummy to avoid
+/// index panics at render time.
+#[derive(Debug, Clone)]
+pub(crate) struct PathShape {
+    pub vertices: Vec<[f32; 2]>,
+    pub in_tangents: Vec<[f32; 2]>,
+    pub out_tangents: Vec<[f32; 2]>,
+    pub closed: bool,
+}
+
+impl PathShape {
+    fn empty() -> Self {
+        Self {
+            vertices: Vec::new(),
+            in_tangents: Vec::new(),
+            out_tangents: Vec::new(),
+            closed: false,
+        }
+    }
+
+    fn vertex_count(&self) -> usize {
+        self.vertices.len()
+    }
+
+    /// Linear per-vertex morph between `self` and `other`, writing
+    /// into a new shape. Caller guarantees `self.vertex_count() ==
+    /// other.vertex_count()` and `self.closed == other.closed` —
+    /// see [`AnimatedPath::sample`] for the bail-out path when
+    /// those don't hold.
+    fn lerp(&self, other: &Self, u: f32) -> Self {
+        debug_assert_eq!(self.vertex_count(), other.vertex_count());
+        let n = self.vertex_count();
+        let mix = |a: &[[f32; 2]], b: &[[f32; 2]]| -> Vec<[f32; 2]> {
+            (0..n)
+                .map(|i| {
+                    [
+                        a[i][0] + (b[i][0] - a[i][0]) * u,
+                        a[i][1] + (b[i][1] - a[i][1]) * u,
+                    ]
+                })
+                .collect()
+        };
+        Self {
+            vertices: mix(&self.vertices, &other.vertices),
+            in_tangents: mix(&self.in_tangents, &other.in_tangents),
+            out_tangents: mix(&self.out_tangents, &other.out_tangents),
+            closed: self.closed,
+        }
+    }
+
+    fn to_path(&self) -> Path {
+        if self.vertices.is_empty() {
+            return Path::new();
+        }
+        let mut path = Path::new();
+        let v0 = self.vertices[0];
+        path = path.move_to(v0[0], v0[1]);
+        for i in 0..self.vertices.len() - 1 {
+            let v_a = self.vertices[i];
+            let v_b = self.vertices[i + 1];
+            let o_a = self.out_tangents[i];
+            let i_b = self.in_tangents[i + 1];
+            path = path.cubic_to(
+                v_a[0] + o_a[0],
+                v_a[1] + o_a[1],
+                v_b[0] + i_b[0],
+                v_b[1] + i_b[1],
+                v_b[0],
+                v_b[1],
+            );
+        }
+        if self.closed && self.vertices.len() >= 2 {
+            // Close with the cubic segment from last vertex back to
+            // first, using last's `out` and first's `in` — matches
+            // the Lottie rendering model and preserves the author's
+            // curvature at the closure seam.
+            let last = *self.vertices.last().unwrap();
+            let first = self.vertices[0];
+            let o_last = *self.out_tangents.last().unwrap();
+            let i_first = self.in_tangents[0];
+            path = path.cubic_to(
+                last[0] + o_last[0],
+                last[1] + o_last[1],
+                first[0] + i_first[0],
+                first[1] + i_first[1],
+                first[0],
+                first[1],
+            );
+            path = path.close();
+        }
+        path
+    }
+}
+
+/// One keyframe in an animated path. `PathShape` is too heavy to
+/// lerp component-wise as a flat `[f32; N]` (vertex count can differ
+/// and tangents are per-vertex), so this lives alongside the
+/// scalar / vec2 / vec4 keyframe types in `layer.rs` but keeps its
+/// own struct.
+#[derive(Debug, Clone)]
+pub(crate) struct PathKey {
+    pub t: f32,
+    pub value: PathShape,
+    pub hold: bool,
+    pub out_tangent: Option<BezierTangent>,
+    pub in_tangent: Option<BezierTangent>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum AnimatedPath {
+    Static(PathShape),
+    Keyframed(Vec<PathKey>),
+}
+
+impl AnimatedPath {
+    fn sample(&self, t: f32) -> PathShape {
+        match self {
+            Self::Static(p) => p.clone(),
+            Self::Keyframed(keys) => sample_path(keys, t),
+        }
+    }
+}
+
+/// Sample an animated path. Piece-wise bezier-eased morph when the
+/// bracketing keyframes share a vertex count; otherwise snap to
+/// `k0.value` — Lottie's "path morph with mismatched vertex counts"
+/// is out of scope for this phase (documented in the crate BACKLOG).
+fn sample_path(keys: &[PathKey], t: f32) -> PathShape {
+    if keys.is_empty() {
+        return PathShape::empty();
+    }
+    if t <= keys[0].t {
+        return keys[0].value.clone();
+    }
+    let last = keys.last().unwrap();
+    if t >= last.t {
+        return last.value.clone();
+    }
+    for pair in keys.windows(2) {
+        let k0 = &pair[0];
+        let k1 = &pair[1];
+        if t >= k0.t && t < k1.t {
+            if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
+                return k0.value.clone();
+            }
+            if k0.value.vertex_count() != k1.value.vertex_count()
+                || k0.value.closed != k1.value.closed
+            {
+                // Vertex-count mismatch means per-vertex lerp has no
+                // well-defined pairing. Snap to `k0` until we cross
+                // into `k1`; avoids a slerp that would blow up some
+                // vertices toward a wrong target.
+                return k0.value.clone();
+            }
+            let linear_u = (t - k0.t) / (k1.t - k0.t);
+            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
+            return k0.value.lerp(&k1.value, u);
+        }
+    }
+    last.value.clone()
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +355,7 @@ impl Geometry {
                 let s = size.sample(t);
                 ellipse_path(p[0], p[1], s[0] * 0.5, s[1] * 0.5)
             }
+            Geometry::Path(animated) => animated.sample(t).to_path(),
         }
     }
 }
@@ -229,6 +405,7 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
         match ty {
             "rc" => group.geometries.push(parse_rectangle(item, fr)),
             "el" => group.geometries.push(parse_ellipse(item, fr)),
+            "sh" => group.geometries.push(parse_path(item, fr)),
             "fl" => group.fill = Some(parse_fill(item, fr)),
             "st" => group.stroke = Some(parse_stroke(item, fr)),
             "tr" => group.transform = Some(TransformSpec::from_value(Some(item), fr)),
@@ -251,6 +428,7 @@ fn single_item_group(v: &Value, fr: f32) -> Option<ShapeGroup> {
     match ty {
         "rc" => group.geometries.push(parse_rectangle(v, fr)),
         "el" => group.geometries.push(parse_ellipse(v, fr)),
+        "sh" => group.geometries.push(parse_path(v, fr)),
         _ => return None,
     }
     Some(group)
@@ -270,6 +448,107 @@ fn parse_ellipse(v: &Value, fr: f32) -> Geometry {
         position: parse_animated_vec2(v.get("p"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0])),
         size: parse_animated_vec2(v.get("s"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0])),
     }
+}
+
+/// Parse a path shape item (`ty: "sh"`). The path data lives in
+/// `sh.ks` with the standard `{ "a": 0|1, "k": <value-or-keyframes> }`
+/// shape — static (`a: 0`) holds a single `PathShape` object, animated
+/// (`a: 1`) holds an array of keyframes.
+///
+/// Malformed input (missing `ks`, missing `k`, vertex-array length
+/// mismatch) falls back to an empty path rather than failing the
+/// whole layer parse — matches the rest of the shape-layer code's
+/// "best-effort" posture.
+fn parse_path(v: &Value, fr: f32) -> Geometry {
+    let Some(ks) = v.get("ks") else {
+        return Geometry::Path(AnimatedPath::Static(PathShape::empty()));
+    };
+    let Some(k) = ks.get("k") else {
+        return Geometry::Path(AnimatedPath::Static(PathShape::empty()));
+    };
+
+    // Animated: `k` is an array of keyframes.
+    if let Some(arr) = k.as_array() {
+        if arr.first().map(|kf| kf.is_object()).unwrap_or(false)
+            && arr.first().and_then(|kf| kf.get("t")).is_some()
+        {
+            let keys = collect_path_keys(arr, fr);
+            return Geometry::Path(if keys.is_empty() {
+                AnimatedPath::Static(PathShape::empty())
+            } else {
+                AnimatedPath::Keyframed(keys)
+            });
+        }
+    }
+
+    // Static: `k` is a single `PathShape` object.
+    let shape = path_shape_from_value(k).unwrap_or_else(PathShape::empty);
+    Geometry::Path(AnimatedPath::Static(shape))
+}
+
+/// Parse a `{ v, i, o, c }` path-shape object. Returns `None` when
+/// any required field is missing or the three arrays have different
+/// lengths — the render path assumes matched lengths and would panic
+/// on mismatch otherwise.
+fn path_shape_from_value(v: &Value) -> Option<PathShape> {
+    let vertices = parse_point_array(v.get("v")?)?;
+    let in_tangents = parse_point_array(v.get("i")?)?;
+    let out_tangents = parse_point_array(v.get("o")?)?;
+    let closed = v
+        .get("c")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if vertices.len() != in_tangents.len() || vertices.len() != out_tangents.len() {
+        return None;
+    }
+    Some(PathShape {
+        vertices,
+        in_tangents,
+        out_tangents,
+        closed,
+    })
+}
+
+fn parse_point_array(v: &Value) -> Option<Vec<[f32; 2]>> {
+    let arr = v.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for pt in arr {
+        let coords = pt.as_array()?;
+        let x = coords.first().and_then(Value::as_f64)? as f32;
+        let y = coords.get(1).and_then(Value::as_f64)? as f32;
+        out.push([x, y]);
+    }
+    Some(out)
+}
+
+fn collect_path_keys(arr: &[Value], fr: f32) -> Vec<PathKey> {
+    // Lottie wraps the path-shape value inside a single-element `s`
+    // array at each keyframe: `"s": [{ "v": [...], "i": [...], ... }]`.
+    // Trailing keyframes sometimes omit `s` to mark the animation's
+    // end timestamp — reuse the previous shape so the interpolator
+    // has a well-defined endpoint, matching the pattern used for
+    // scalar / vec2 / vec4 keys.
+    let mut last_value = PathShape::empty();
+    arr.iter()
+        .filter_map(|kf| {
+            let t_frames = kf.get("t")?.as_f64()? as f32;
+            let value = kf
+                .get("s")
+                .and_then(|s| s.as_array())
+                .and_then(|s_arr| s_arr.first())
+                .and_then(path_shape_from_value)
+                .unwrap_or_else(|| last_value.clone());
+            last_value = value.clone();
+            let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
+            Some(PathKey {
+                t: t_frames / fr,
+                value,
+                hold,
+                out_tangent: tangent_from_key(kf, "o"),
+                in_tangent: tangent_from_key(kf, "i"),
+            })
+        })
+        .collect()
 }
 
 fn parse_fill(v: &Value, fr: f32) -> FillSpec {
@@ -400,7 +679,7 @@ mod tests {
             {
                 "ty": "gr",
                 "it": [
-                    { "ty": "sh" }, // path — not yet implemented
+                    { "ty": "sr" }, // polystar — not yet implemented
                     { "ty": "tm" }, // trim path — not yet implemented
                     {
                         "ty": "rc",
@@ -413,5 +692,141 @@ mod tests {
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
         assert_eq!(content.groups[0].geometries.len(), 1, "rect should still parse");
+    }
+
+    #[test]
+    fn parses_static_path_shape() {
+        // A tiny closed triangle with zero tangents (straight-line
+        // segments even though the renderer emits cubic_to). Exercises
+        // the `sh` parse path end-to-end.
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "sh",
+                        "ks": {
+                            "a": 0,
+                            "k": {
+                                "v": [[0.0, 0.0], [100.0, 0.0], [50.0, 86.6]],
+                                "i": [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                                "o": [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                                "c": true
+                            }
+                        }
+                    },
+                    {
+                        "ty": "fl",
+                        "c": { "k": [1.0, 0.5, 0.25, 1.0] },
+                        "o": { "k": 100.0 }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        assert_eq!(content.groups[0].geometries.len(), 1);
+        match &content.groups[0].geometries[0] {
+            Geometry::Path(AnimatedPath::Static(shape)) => {
+                assert_eq!(shape.vertices.len(), 3);
+                assert!(shape.closed);
+            }
+            other => panic!("expected static path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_animated_path_keyframes() {
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "sh",
+                        "ks": {
+                            "a": 1,
+                            "k": [
+                                {
+                                    "t": 0.0,
+                                    "s": [{
+                                        "v": [[0.0, 0.0], [10.0, 0.0]],
+                                        "i": [[0.0, 0.0], [0.0, 0.0]],
+                                        "o": [[0.0, 0.0], [0.0, 0.0]],
+                                        "c": false
+                                    }]
+                                },
+                                {
+                                    "t": 60.0,
+                                    "s": [{
+                                        "v": [[0.0, 10.0], [10.0, 10.0]],
+                                        "i": [[0.0, 0.0], [0.0, 0.0]],
+                                        "o": [[0.0, 0.0], [0.0, 0.0]],
+                                        "c": false
+                                    }]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        match &content.groups[0].geometries[0] {
+            Geometry::Path(AnimatedPath::Keyframed(keys)) => {
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0].value.vertices[0], [0.0, 0.0]);
+                assert_eq!(keys[1].value.vertices[0], [0.0, 10.0]);
+                // 60 frames at 60 fps = 1 second.
+                assert!((keys[1].t - 1.0).abs() < f32::EPSILON);
+            }
+            other => panic!("expected keyframed path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn animated_path_morphs_mid_interval() {
+        // Two keyframes at t=0s and t=1s, vertex 0 moves from
+        // [0, 0] to [0, 10]. Mid-interval sample at t=0.5 should
+        // land halfway (linear since no bezier tangents).
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "sh",
+                        "ks": {
+                            "a": 1,
+                            "k": [
+                                {
+                                    "t": 0.0,
+                                    "s": [{
+                                        "v": [[0.0, 0.0], [10.0, 0.0]],
+                                        "i": [[0.0, 0.0], [0.0, 0.0]],
+                                        "o": [[0.0, 0.0], [0.0, 0.0]],
+                                        "c": false
+                                    }]
+                                },
+                                {
+                                    "t": 60.0,
+                                    "s": [{
+                                        "v": [[0.0, 10.0], [10.0, 10.0]],
+                                        "i": [[0.0, 0.0], [0.0, 0.0]],
+                                        "o": [[0.0, 0.0], [0.0, 0.0]],
+                                        "c": false
+                                    }]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        let Geometry::Path(path) = &content.groups[0].geometries[0] else {
+            panic!("expected path");
+        };
+        let mid = path.sample(0.5);
+        assert_eq!(mid.vertices.len(), 2);
+        assert!((mid.vertices[0][1] - 5.0).abs() < 1e-4);
+        assert!((mid.vertices[1][1] - 5.0).abs() < 1e-4);
     }
 }
