@@ -150,6 +150,37 @@ it.
     a `zip` dep; `from_dotlottie_bytes(&[u8])` unpacks, loads the
     JSON, and wires up any image assets.
 
+- [ ] **dotLottie state machines** — *depends on dotLottie archive*
+  - **Why:** dotLottie's spec extension beyond core Lottie JSON. Apps
+    ship one archive that defines named states (e.g. `idle`, `hover`,
+    `clicked`) where each state points at a segment of the master
+    animation, plus event-triggered transitions between states. Common
+    in Lottie-driven UI components (interactive icons, onboarding
+    hero animations) — authors want to ship one `.lottie` with all
+    the interaction states baked in rather than wire state handling
+    in application code.
+  - **How:** Archive member `state_machine.json` alongside
+    `animation.json`. Decode into a struct paralleling Blinc's
+    existing [`blinc_core::FsmRuntime`](../../crates/blinc_core/src/fsm.rs)
+    so transition + guard logic reuses the framework FSM primitive
+    instead of reinventing:
+    - Named states → `StateId`s. Each carries a `segment: Range<f32>`
+      on the master timeline + a loop flag + playback speed.
+    - Events (`pointer.enter`, `pointer.click`, `custom("foo")`) →
+      `TransitionTrigger`s. Numeric inputs (`progress >= 0.5`) go
+      through guard closures.
+    - `LottieStateMachine` wraps `LottiePlayer` with a current-state
+      pointer + event queue. `.handle(event)` fires the FSM and
+      updates the player's playback range.
+  - **Scope notes:**
+    - Lands AFTER `.lottie` archive parsing — there's no JSON-only
+      state-machine format worth implementing in core Lottie.
+    - Reference: <https://dotlottie.io/state-machines>.
+    - Segment playback (in/out range on the player) is already
+      parsed via layer `ip`/`op`; the missing piece is a "play a
+      sub-range of the composition, not just per-layer" API on
+      `LottiePlayer` that the state machine drives.
+
 - [ ] **Keyframe lookup acceleration**
   - **Why:** `sample_*` does a linear scan per property per frame. Fine
     for short timelines, quadratic behavior on long ones with many
