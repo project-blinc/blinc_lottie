@@ -138,7 +138,7 @@ impl PathShape {
         }
     }
 
-    fn to_path(&self) -> Path {
+    pub(crate) fn to_path(&self) -> Path {
         if self.vertices.is_empty() {
             return Path::new();
         }
@@ -203,7 +203,7 @@ pub(crate) enum AnimatedPath {
 }
 
 impl AnimatedPath {
-    fn sample(&self, t: f32) -> PathShape {
+    pub(crate) fn sample(&self, t: f32) -> PathShape {
         match self {
             Self::Static(p) => p.clone(),
             Self::Keyframed(keys) => sample_path(keys, t),
@@ -587,21 +587,28 @@ fn parse_ellipse(v: &Value, fr: f32) -> Geometry {
     }
 }
 
-/// Parse a path shape item (`ty: "sh"`). The path data lives in
-/// `sh.ks` with the standard `{ "a": 0|1, "k": <value-or-keyframes> }`
-/// shape — static (`a: 0`) holds a single `PathShape` object, animated
-/// (`a: 1`) holds an array of keyframes.
-///
-/// Malformed input (missing `ks`, missing `k`, vertex-array length
-/// mismatch) falls back to an empty path rather than failing the
-/// whole layer parse — matches the rest of the shape-layer code's
-/// "best-effort" posture.
+/// Parse a path shape item (`ty: "sh"`). Thin wrapper that extracts
+/// the `ks` payload and delegates to [`parse_animated_path`] — the
+/// same parser masks on a layer use via `masksProperties[*].pt`.
 fn parse_path(v: &Value, fr: f32) -> Geometry {
     let Some(ks) = v.get("ks") else {
         return Geometry::Path(AnimatedPath::Static(PathShape::empty()));
     };
+    Geometry::Path(parse_animated_path(ks, fr))
+}
+
+/// Shared parser for the `{ "a": 0|1, "k": <value-or-keyframes> }`
+/// animated-path payload. Consumed by both `sh` shape items and
+/// layer-level `masksProperties[*].pt` entries — the JSON shape is
+/// identical so there's no reason to duplicate the walker.
+///
+/// Static (`a: 0`): `k` holds a single `PathShape` object.
+/// Animated (`a: 1`): `k` holds an array of keyframes.
+/// Malformed input falls back to an empty path; matches the rest of
+/// the shape-layer "best-effort" posture.
+pub(crate) fn parse_animated_path(ks: &Value, fr: f32) -> AnimatedPath {
     let Some(k) = ks.get("k") else {
-        return Geometry::Path(AnimatedPath::Static(PathShape::empty()));
+        return AnimatedPath::Static(PathShape::empty());
     };
 
     // Animated: `k` is an array of keyframes.
@@ -610,17 +617,17 @@ fn parse_path(v: &Value, fr: f32) -> Geometry {
             && arr.first().and_then(|kf| kf.get("t")).is_some()
         {
             let keys = collect_path_keys(arr, fr);
-            return Geometry::Path(if keys.is_empty() {
+            return if keys.is_empty() {
                 AnimatedPath::Static(PathShape::empty())
             } else {
                 AnimatedPath::Keyframed(keys)
-            });
+            };
         }
     }
 
     // Static: `k` is a single `PathShape` object.
     let shape = path_shape_from_value(k).unwrap_or_else(PathShape::empty);
-    Geometry::Path(AnimatedPath::Static(shape))
+    AnimatedPath::Static(shape)
 }
 
 /// Parse a `{ v, i, o, c }` path-shape object. Returns `None` when

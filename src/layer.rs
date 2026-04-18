@@ -16,11 +16,11 @@
 //! no-ops.
 
 use blinc_core::draw::Transform;
-use blinc_core::layer::{Brush, Color, CornerRadius, Rect};
+use blinc_core::layer::{Brush, ClipShape, Color, CornerRadius, Rect};
 use blinc_core::DrawContext;
 use serde_json::Value;
 
-use crate::shape::ShapeContent;
+use crate::shape::{parse_animated_path, AnimatedPath, ShapeContent};
 
 /// Parsed, render-ready Lottie layer.
 #[derive(Debug, Clone)]
@@ -33,6 +33,49 @@ pub(crate) struct Layer {
     /// `scene_t < out_seconds`.
     pub out_seconds: f32,
     pub transform: TransformSpec,
+    /// Layer-level `masksProperties` — clips the layer content to
+    /// the intersection of all `Add`-mode mask paths. Other modes
+    /// (Subtract / Intersect / Lighten / Darken / Difference) parse
+    /// but don't apply yet; they're rarer in real-world assets and
+    /// would need either inverse-clip support from `DrawContext` or
+    /// an offscreen render pass.
+    pub masks: Vec<MaskSpec>,
+}
+
+/// A single mask entry from a layer's `masksProperties` array.
+/// Paths reuse the same `AnimatedPath` machinery that `sh` shape
+/// items use — Lottie stores both in the identical `{ a, k }`
+/// wrapper shape.
+#[derive(Debug, Clone)]
+pub(crate) struct MaskSpec {
+    pub mode: MaskMode,
+    pub path: AnimatedPath,
+    /// Mask opacity. Stored but not yet consumed in render — Blinc's
+    /// `push_clip` is binary (in or out), so a per-mask alpha ramp
+    /// needs an offscreen composite pass that's out of scope for
+    /// this cut.
+    #[allow(dead_code)]
+    pub opacity: AnimatedF32,
+    /// Invert flag (Lottie `inv`). Parsed for forward-compat; not
+    /// applied until `Subtract` mode lands, at which point invert
+    /// becomes the same operation with the flag flipped.
+    #[allow(dead_code)]
+    pub invert: bool,
+}
+
+/// Combination mode for a single mask. Parsed from Lottie's
+/// single-letter encoding (`"a"`, `"s"`, `"i"`, `"l"`, `"da"`,
+/// `"f"`). Only `Add` is rendered in this revision; others snap
+/// to `Add` with a trace-level warning so unsupported files still
+/// render a best-effort approximation instead of nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaskMode {
+    Add,
+    Subtract,
+    Intersect,
+    Lighten,
+    Darken,
+    Difference,
 }
 
 #[derive(Debug, Clone)]
@@ -432,11 +475,17 @@ impl Layer {
             4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
             _ => LayerKind::Unknown,
         };
+        let masks = v
+            .get("masksProperties")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().map(|m| parse_mask(m, fr)).collect())
+            .unwrap_or_default();
         Self {
             kind,
             in_seconds: in_frames / fr,
             out_seconds: out_frames / fr,
             transform,
+            masks,
         }
     }
 
@@ -451,6 +500,30 @@ impl Layer {
         }
         let xform = self.transform.sample(scene_t);
         push_layer_transform(dc, &xform);
+
+        // Stack up `Add`-mode masks as `ClipShape::Path` pushes.
+        // Sequential `push_clip`s already intersect at the
+        // renderer level, which matches Lottie's "all masks
+        // combine with AND-like semantics" default for Add-mode.
+        // Track the push count so we pop exactly as many as went
+        // in — a mid-mask bail-out would desync the clip stack.
+        let mut pushed_clips = 0usize;
+        for mask in &self.masks {
+            // Non-Add modes aren't yet supported. Treating them as
+            // Add is the forgiving fallback — assets that mix modes
+            // (rare) render over-clipped rather than leaking content
+            // past the author-intended bounds. Subtract / intersect
+            // done properly need either inverse-clip support from
+            // `DrawContext` or an offscreen composite pass; tracked
+            // as a Phase 4 item in the BACKLOG.
+            let _ = mask.mode;
+            let shape = mask.path.sample(scene_t);
+            if shape.vertices.is_empty() {
+                continue;
+            }
+            dc.push_clip(ClipShape::Path(shape.to_path()));
+            pushed_clips += 1;
+        }
 
         match &self.kind {
             LayerKind::Solid {
@@ -470,7 +543,48 @@ impl Layer {
             LayerKind::Unknown => {}
         }
 
+        for _ in 0..pushed_clips {
+            dc.pop_clip();
+        }
+
         pop_layer_transform(dc);
+    }
+}
+
+/// Parse one entry from a layer's `masksProperties` array into a
+/// [`MaskSpec`]. Shape data is routed through the shared
+/// `parse_animated_path` helper that `sh` items use.
+fn parse_mask(v: &Value, fr: f32) -> MaskSpec {
+    let mode = match v.get("mode").and_then(Value::as_str) {
+        Some("s") => MaskMode::Subtract,
+        Some("i") => MaskMode::Intersect,
+        Some("l") => MaskMode::Lighten,
+        Some("da") => MaskMode::Darken,
+        Some("f") => MaskMode::Difference,
+        // "a" or missing defaults to Add — the common case.
+        _ => MaskMode::Add,
+    };
+    let path = v
+        .get("pt")
+        .map(|pt| parse_animated_path(pt, fr))
+        .unwrap_or(AnimatedPath::Static(crate::shape::PathShape {
+            vertices: Vec::new(),
+            in_tangents: Vec::new(),
+            out_tangents: Vec::new(),
+            closed: false,
+        }));
+    let opacity = parse_animated_scalar(v.get("o"), fr)
+        .unwrap_or(AnimatedF32::Static(100.0))
+        .map(|o| (o / 100.0).clamp(0.0, 1.0));
+    let invert = v
+        .get("inv")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    MaskSpec {
+        mode,
+        path,
+        opacity,
+        invert,
     }
 }
 
@@ -891,5 +1005,74 @@ mod tests {
         assert!((layer.transform.sample(0.75).opacity - 0.0).abs() < 1e-5);
         // Exactly at (or past) the next keyframe, the new value applies.
         assert!((layer.transform.sample(1.0).opacity - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_add_mask_with_static_path() {
+        let v = json!({
+            "ty": 4,
+            "ip": 0,
+            "op": 60,
+            "ks": {},
+            "shapes": [],
+            "masksProperties": [
+                {
+                    "mode": "a",
+                    "pt": {
+                        "a": 0,
+                        "k": {
+                            "v": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                            "i": [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                            "o": [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                            "c": true
+                        }
+                    },
+                    "o": { "a": 0, "k": 100 },
+                    "inv": false
+                }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        assert_eq!(layer.masks.len(), 1);
+        let mask = &layer.masks[0];
+        assert_eq!(mask.mode, MaskMode::Add);
+        assert!(!mask.invert);
+        let shape = mask.path.sample(0.0);
+        assert_eq!(shape.vertices.len(), 4);
+        assert!(shape.closed);
+    }
+
+    #[test]
+    fn parses_mask_modes_from_single_letter_encoding() {
+        let make = |mode: &str| {
+            json!({
+                "ty": 4, "ip": 0, "op": 60, "ks": {}, "shapes": [],
+                "masksProperties": [{
+                    "mode": mode,
+                    "pt": { "a": 0, "k": { "v": [], "i": [], "o": [], "c": false } },
+                    "o": { "a": 0, "k": 100 }
+                }]
+            })
+        };
+        for (tag, expected) in [
+            ("a", MaskMode::Add),
+            ("s", MaskMode::Subtract),
+            ("i", MaskMode::Intersect),
+            ("l", MaskMode::Lighten),
+            ("da", MaskMode::Darken),
+            ("f", MaskMode::Difference),
+        ] {
+            let layer = Layer::from_value(&make(tag), 60.0);
+            assert_eq!(layer.masks[0].mode, expected, "mode {tag}");
+        }
+    }
+
+    #[test]
+    fn layer_without_masks_property_has_empty_masks_vec() {
+        let v = json!({
+            "ty": 4, "ip": 0, "op": 60, "ks": {}, "shapes": []
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        assert!(layer.masks.is_empty());
     }
 }
