@@ -16,7 +16,7 @@
 //! Other layer types parse as [`LayerKind::Unknown`] and render as
 //! no-ops.
 
-use blinc_core::draw::Transform;
+use blinc_core::draw::{LayerConfig, LayerEffect, Transform};
 use blinc_core::layer::{Brush, ClipShape, Color, CornerRadius, Rect};
 use blinc_core::DrawContext;
 use serde_json::Value;
@@ -59,6 +59,104 @@ pub(crate) struct Layer {
     /// parents produce an empty chain so malformed exports
     /// render the layer un-parented rather than looping forever.
     pub parent_chain: Vec<usize>,
+    /// Effect-layer chain parsed from `ef`. Drop shadow / Gaussian
+    /// blur are applied; unsupported effect types (Tritone, Fill,
+    /// Slider Control …) parse as `None` and get dropped. Rendered
+    /// by wrapping the layer's paint in a `push_layer` with the
+    /// sampled [`LayerEffect`]s — blur radii and shadow offsets
+    /// are still in source-space units because the layer's own
+    /// transform is applied *inside* that push.
+    pub effects: Vec<EffectSpec>,
+}
+
+/// Parsed Lottie layer effect. Currently restricted to the two
+/// effect types dotLottie-produced assets actually ship with:
+/// Drop Shadow and Gaussian Blur. Other effect types (Glow,
+/// Tritone, Color Balance, Fill, Slider Control) parse-and-skip
+/// — we document that explicitly so the loader's permissive
+/// posture isn't mistaken for "everything is supported."
+#[derive(Debug, Clone)]
+pub(crate) enum EffectSpec {
+    /// Lottie effect type 25. Four animatable properties:
+    /// color, opacity (0–255 → normalised to 0–1), direction
+    /// (degrees, AE "north = 0°"), distance, softness.
+    DropShadow {
+        color: AnimatedVec4,
+        opacity: AnimatedF32,
+        direction: AnimatedF32,
+        distance: AnimatedF32,
+        softness: AnimatedF32,
+    },
+    /// Lottie effect type 29. One animatable property: Blurriness.
+    /// "Blur Dimensions" (horizontal / vertical / both) parses but
+    /// isn't applied — every blur is both-axis Gaussian.
+    Blur { radius: AnimatedF32 },
+}
+
+impl EffectSpec {
+    /// Sample the effect into Blinc's [`LayerEffect`] representation
+    /// for a specific scene time.
+    pub(crate) fn sample(&self, t: f32) -> LayerEffect {
+        match self {
+            EffectSpec::DropShadow {
+                color,
+                opacity,
+                direction,
+                distance,
+                softness,
+            } => {
+                let c = color.sample(t);
+                let o = opacity.sample(t);
+                let dir_rad = direction.sample(t).to_radians();
+                let dist = distance.sample(t);
+                // AE convention: direction 0° points up, 90° right,
+                // 180° down, 270° left. Screen-space Y grows
+                // downward, so flip the cosine.
+                let dx = dist * dir_rad.sin();
+                let dy = -dist * dir_rad.cos();
+                LayerEffect::DropShadow {
+                    offset_x: dx,
+                    offset_y: dy,
+                    blur: softness.sample(t).max(0.0),
+                    spread: 0.0,
+                    color: Color::rgba(c[0], c[1], c[2], c[3] * o),
+                }
+            }
+            EffectSpec::Blur { radius } => LayerEffect::blur(radius.sample(t).max(0.0)),
+        }
+    }
+}
+
+/// Parse a single entry from a layer's `ef` array. Returns `None`
+/// for unsupported effect types — the caller drops them, matching
+/// the shape-item catch-all pattern elsewhere in this module.
+pub(crate) fn parse_effect(v: &Value, fr: f32) -> Option<EffectSpec> {
+    let ty = v.get("ty").and_then(Value::as_u64)?;
+    // Each effect parameter is `{ "ty": <kind>, "nm": "...", "v": { "a": ..., "k": ... } }`.
+    // Peel off the `v` wrapper so the shared animated-value
+    // parsers work without modification.
+    let params = v.get("ef").and_then(Value::as_array)?;
+    let prop_v = |idx: usize| params.get(idx).and_then(|p| p.get("v"));
+    match ty {
+        25 => Some(EffectSpec::DropShadow {
+            color: parse_animated_vec4(prop_v(0), fr)
+                .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0])),
+            // Opacity authored as 0–255 in AE's Drop Shadow dialog;
+            // normalise once at load so renderers see the Blinc
+            // convention (0–1). Any keyframe values outside that
+            // range clamp at sample time via `Color::rgba` below.
+            opacity: parse_animated_scalar(prop_v(1), fr)
+                .unwrap_or(AnimatedF32::Static(255.0))
+                .map(|o| (o / 255.0).clamp(0.0, 1.0)),
+            direction: parse_animated_scalar(prop_v(2), fr).unwrap_or(AnimatedF32::Static(0.0)),
+            distance: parse_animated_scalar(prop_v(3), fr).unwrap_or(AnimatedF32::Static(0.0)),
+            softness: parse_animated_scalar(prop_v(4), fr).unwrap_or(AnimatedF32::Static(0.0)),
+        }),
+        29 => Some(EffectSpec::Blur {
+            radius: parse_animated_scalar(prop_v(0), fr).unwrap_or(AnimatedF32::Static(0.0)),
+        }),
+        _ => None,
+    }
 }
 
 /// A single mask entry from a layer's `masksProperties` array.
@@ -501,6 +599,11 @@ impl Layer {
             .unwrap_or_default();
         let ind = v.get("ind").and_then(Value::as_i64).map(|n| n as i32);
         let parent_ind = v.get("parent").and_then(Value::as_i64).map(|n| n as i32);
+        let effects = v
+            .get("ef")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(|e| parse_effect(e, fr)).collect())
+            .unwrap_or_default();
         Self {
             kind,
             in_seconds: in_frames / fr,
@@ -510,6 +613,7 @@ impl Layer {
             ind,
             parent_ind,
             parent_chain: Vec::new(),
+            effects,
         }
     }
 
@@ -522,6 +626,26 @@ impl Layer {
         if scene_t < self.in_seconds || scene_t >= self.out_seconds {
             return;
         }
+
+        // Effect layers (`ef`) wrap the whole draw pass — transform
+        // + masks + content all land inside the offscreen layer
+        // `push_layer` creates, so the blur / shadow operates on the
+        // layer's composited output. `pop_layer` is matched 1:1.
+        let effects_pushed = if !self.effects.is_empty() {
+            let effects = self
+                .effects
+                .iter()
+                .map(|e| e.sample(scene_t))
+                .collect();
+            dc.push_layer(LayerConfig {
+                effects,
+                ..LayerConfig::default()
+            });
+            true
+        } else {
+            false
+        };
+
         let xform = self.transform.sample(scene_t);
         push_layer_transform(dc, &xform);
 
@@ -572,6 +696,10 @@ impl Layer {
         }
 
         pop_layer_transform(dc);
+
+        if effects_pushed {
+            dc.pop_layer();
+        }
     }
 }
 
@@ -1074,6 +1202,88 @@ mod tests {
             eased_quarter < linear_quarter - 0.05,
             "eased quarter {eased_quarter} should trail linear {linear_quarter}"
         );
+    }
+
+    #[test]
+    fn parses_drop_shadow_effect() {
+        // Layer with a single Drop Shadow effect — spec order is
+        // [Color, Opacity (0-255), Direction (°), Distance, Softness].
+        // At t=0 with direction 135° and distance 10, the shadow
+        // offset is (10·sin135, -10·cos135) ≈ (7.07, 7.07).
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff",
+            "ef": [
+                {
+                    "ty": 25,
+                    "nm": "Drop Shadow",
+                    "ef": [
+                        { "ty": 2, "nm": "Shadow Color", "v": { "k": [0.0, 0.0, 0.0, 1.0] } },
+                        { "ty": 7, "nm": "Opacity", "v": { "k": 128.0 } },
+                        { "ty": 0, "nm": "Direction", "v": { "k": 135.0 } },
+                        { "ty": 0, "nm": "Distance", "v": { "k": 10.0 } },
+                        { "ty": 0, "nm": "Softness", "v": { "k": 5.0 } }
+                    ]
+                }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        assert_eq!(layer.effects.len(), 1);
+        match layer.effects[0].sample(0.0) {
+            LayerEffect::DropShadow { offset_x, offset_y, blur, color, .. } => {
+                assert!((offset_x - 7.07).abs() < 0.05, "offset_x ≈ 7.07, got {offset_x}");
+                assert!((offset_y - 7.07).abs() < 0.05, "offset_y ≈ 7.07, got {offset_y}");
+                assert!((blur - 5.0).abs() < 1e-5);
+                assert!((color.a - 128.0 / 255.0).abs() < 1e-3, "alpha = {}", color.a);
+            }
+            other => panic!("expected DropShadow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_gaussian_blur_effect() {
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff",
+            "ef": [
+                {
+                    "ty": 29,
+                    "nm": "Gaussian Blur",
+                    "ef": [
+                        { "ty": 0, "nm": "Blurriness", "v": { "k": 12.0 } },
+                        { "ty": 7, "nm": "Blur Dimensions", "v": { "k": 1.0 } }
+                    ]
+                }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        assert_eq!(layer.effects.len(), 1);
+        match layer.effects[0].sample(0.0) {
+            LayerEffect::Blur { radius, .. } => {
+                assert!((radius - 12.0).abs() < 1e-5);
+            }
+            other => panic!("expected Blur, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_effect_types_drop_silently() {
+        // Effect type 20 (Tritone) isn't implemented. Loader should
+        // drop it rather than erroring — matching the rest of the
+        // module's lenient-parse contract.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 10.0, "sh": 10.0, "sc": "#000000",
+            "ef": [
+                { "ty": 20, "nm": "Tritone", "ef": [] },
+                { "ty": 29, "nm": "Gaussian Blur", "ef": [{ "ty": 0, "nm": "Blurriness", "v": { "k": 3.0 } }] }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        assert_eq!(layer.effects.len(), 1, "unsupported effect should drop, blur should stay");
     }
 
     #[test]

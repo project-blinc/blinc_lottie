@@ -104,12 +104,24 @@ it.
     `bevel`). Blinc's `Stroke` builder already supports all three —
     just plumb the values through.
 
-- [ ] **Drop shadow / blur / glow**
-  - **Why:** Common in "UI motion" templates.
-  - **How:** Lottie exposes these as *effect layers* (`ef` array on a
-    layer), not shape items. Blinc has `LayerEffect::DropShadow` /
-    `Blur` / `Glow` — map via `push_effect` / `pop_effect` before /
-    after the affected layer's draw call.
+- [x] **Drop shadow / blur effect layers** — shipped. Each
+  `Layer` parses `ef` into `Vec<EffectSpec>`; rendering wraps the
+  transform + content pass in `push_layer` with the sampled
+  [`LayerEffect`]s (shadow offset/blur/color, blur radius). At
+  sample time Drop Shadow direction / distance fold into
+  `offset_x / offset_y` using AE's "north = 0°" convention; opacity
+  normalises 0–255 → 0–1; shadow color alpha multiplies through.
+  Gaussian Blur maps directly to `LayerEffect::blur`. Unsupported
+  effect types (Tritone, Fill, Slider Control, Glow) drop
+  silently with the rest of the permissive-parse posture. Spread
+  / Blur Dimensions / quality are parsed-and-ignored — every blur
+  is both-axis with the default quality.
+
+- [ ] **Outer Glow effect**
+  - **Why:** Lottie's native "Glow" is an AE compound effect that
+    dotLottie doesn't standardise into a stable type number; some
+    authoring tools emit it as a Tritone + Gaussian Blur chain.
+    When the format settles, map to `LayerEffect::Glow`.
 
 - [ ] **Masks (`masksProperties`)**
   - **Why:** Required for any scene with clipped content.
