@@ -70,15 +70,37 @@ struct StateMachineSpec {
     initial: String,
     #[serde(default)]
     states: Vec<StateEntry>,
-    // These parse but aren't wired to runtime state yet. Kept in
-    // the schema so malformed archives surface parse errors
-    // consistently with compliant ones.
+    /// Author-declared inputs with initial values. Seeds
+    /// `LottieStateMachine`'s `InputStore` at load and also
+    /// backs the `Reset` action — resetting an input returns it
+    /// to the value listed here.
+    #[serde(default)]
+    inputs: Vec<InputSpec>,
+    /// Interaction callbacks (`OnClick` / `OnPointerEnter` / …)
+    /// map gesture events to `send()` inputs. Parsing them
+    /// requires a host-side event routing layer that doesn't
+    /// exist yet, so for now we keep the field to surface parse
+    /// errors consistently and drop the bodies.
     #[serde(default)]
     #[allow(dead_code)]
     interactions: Vec<serde_json::Value>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    inputs: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum InputSpec {
+    /// Seed a numeric input with `value`. Any keyframe-animated
+    /// numeric input would live here too, but the spec's `inputs`
+    /// array only declares static defaults — runtime mutation is
+    /// what `send_numeric` + `SetNumeric` actions are for.
+    Numeric { name: String, value: f64 },
+    String { name: String, value: String },
+    Boolean { name: String, value: bool },
+    /// Unknown input type (e.g. `Vector2`, `Color`, `Trigger`)
+    /// parses as a no-op so decoding doesn't fail. Trigger inputs
+    /// in particular are cascading events — tracked as future work.
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +341,18 @@ pub struct LottieStateMachine {
     /// hold `Fn() -> bool` / `FnMut()` — nullary closures that can
     /// only reach state through captured references.
     inputs: Arc<Mutex<InputStore>>,
+    /// Author-declared defaults — captured at load from the spec's
+    /// top-level `inputs` array, consumed by the `Reset` action.
+    /// Immutable for the machine's lifetime, so `Arc` without a
+    /// Mutex suffices.
+    defaults: Arc<InputDefaults>,
+    /// Event queue populated by `Fire` actions running inside
+    /// FSM transitions. Drained by [`Self::send`] after each
+    /// edge fires so cascading events process serially without
+    /// re-entering the FSM mid-transition. Bounded cascade depth
+    /// enforced by [`MAX_CASCADE_DEPTH`] to short-circuit action
+    /// loops (`A.on(evt) → fire(evt) → A.on(evt) → …`).
+    pending_events: Arc<Mutex<Vec<EventId>>>,
     /// `(event_id, source_state_id) → Tweened metadata` for every
     /// FSM edge derived from a `Tweened` transition. `send()`
     /// consults this after an edge fires and, if present, arms
@@ -329,6 +363,12 @@ pub struct LottieStateMachine {
     /// `None` whenever the player renders a single state normally.
     tween: Option<Tween>,
 }
+
+/// Hard cap on `Fire`-driven event cascades inside a single
+/// `send()`. Any authored cycle (A→B→A, A→A) would otherwise
+/// spin forever; at 32 hops we bail, leaving the machine in
+/// whatever state the cascade reached.
+const MAX_CASCADE_DEPTH: usize = 32;
 
 /// Frozen parameters for a `Tweened` transition — precomputed at
 /// load so that `send()` can arm the tween without allocating.
@@ -373,6 +413,26 @@ struct InputStore {
     numeric: HashMap<String, f64>,
     string: HashMap<String, String>,
     boolean: HashMap<String, bool>,
+}
+
+/// Snapshot of the author-declared initial values from the spec's
+/// top-level `inputs` array. The `Reset` action restores an input
+/// to its entry here; if the input wasn't declared, Reset clears
+/// it (matches the rest of the "unseeded = default-value" contract).
+#[derive(Debug, Default)]
+struct InputDefaults {
+    numeric: HashMap<String, f64>,
+    string: HashMap<String, String>,
+    boolean: HashMap<String, bool>,
+}
+
+/// Mutable view handed to each [`ActionOp`] during execution.
+/// Bundles the input store with the ancillary pieces actions might
+/// touch (defaults for Reset, pending-event queue for Fire).
+struct ActionContext<'a> {
+    store: &'a mut InputStore,
+    defaults: &'a InputDefaults,
+    pending_events: &'a mut Vec<EventId>,
 }
 
 impl LottieStateMachine {
@@ -458,10 +518,69 @@ impl LottieStateMachine {
         // into a conjunctive guard closure shared across all FSM
         // edges generated from that transition. Actions likewise
         // compile into an action closure attached to every edge.
+        // Pre-scan: pluck every event name that any transition
+        // references, either as an Event guard or as the target of
+        // a `Fire` action. Building the event→id map up front lets
+        // action closures bind a stable `EventId` even when the Fire
+        // target's own Event guard appears later in the walk.
         let mut event_names: HashMap<String, EventId> = HashMap::new();
+        for entry in &spec.states {
+            for t in entry_transitions(entry) {
+                let (guards, actions) = match t {
+                    TransitionSpec::Transition { guards, actions, .. }
+                    | TransitionSpec::Tweened {
+                        guards, actions, ..
+                    } => (guards, actions),
+                };
+                for g in guards {
+                    if let GuardSpec::Event { input_name } = g {
+                        let next_id = event_names.len() as EventId;
+                        event_names.entry(input_name.clone()).or_insert(next_id);
+                    }
+                }
+                for a in actions {
+                    if let ActionSpec::Fire { input_name } = a {
+                        let next_id = event_names.len() as EventId;
+                        event_names.entry(input_name.clone()).or_insert(next_id);
+                    }
+                }
+            }
+        }
+
         let mut transitions: Vec<Transition> = Vec::new();
         let mut tween_edges: HashMap<(EventId, StateId), TweenParams> = HashMap::new();
-        let inputs: Arc<Mutex<InputStore>> = Arc::new(Mutex::new(InputStore::default()));
+
+        // Seed the input store from the spec's top-level `inputs`
+        // array. Also snapshot those defaults so the `Reset` action
+        // has something to return to — without a defaults table the
+        // action can't know whether "reset" means zero, empty, or
+        // the author-authored initial value.
+        let mut initial_store = InputStore::default();
+        let mut defaults = InputDefaults::default();
+        for spec_input in &spec.inputs {
+            match spec_input {
+                InputSpec::Numeric { name, value } => {
+                    initial_store.numeric.insert(name.clone(), *value);
+                    defaults.numeric.insert(name.clone(), *value);
+                }
+                InputSpec::String { name, value } => {
+                    initial_store.string.insert(name.clone(), value.clone());
+                    defaults.string.insert(name.clone(), value.clone());
+                }
+                InputSpec::Boolean { name, value } => {
+                    initial_store.boolean.insert(name.clone(), *value);
+                    defaults.boolean.insert(name.clone(), *value);
+                }
+                InputSpec::Unsupported => {}
+            }
+        }
+        let inputs: Arc<Mutex<InputStore>> = Arc::new(Mutex::new(initial_store));
+        let defaults = Arc::new(defaults);
+        // Deferred-event queue. `Fire` actions push event_ids here
+        // from inside the FSM's action closure; `send()` drains
+        // the queue *after* each edge fires so cascading events
+        // don't re-enter the FSM mid-transition.
+        let pending_events: Arc<Mutex<Vec<EventId>>> = Arc::new(Mutex::new(Vec::new()));
 
         for (i, entry) in spec.states.iter().enumerate() {
             let from_id = i as StateId;
@@ -549,15 +668,25 @@ impl LottieStateMachine {
                             });
                         }
 
-                        let action_ops: Vec<ActionOp> =
-                            actions.iter().filter_map(ActionOp::from_spec).collect();
+                        let action_ops: Vec<ActionOp> = actions
+                            .iter()
+                            .filter_map(|a| ActionOp::from_spec(a, &event_names))
+                            .collect();
                         if !action_ops.is_empty() {
                             let ops = action_ops;
                             let store = Arc::clone(&inputs);
+                            let defaults = Arc::clone(&defaults);
+                            let pending = Arc::clone(&pending_events);
                             tr = tr.with_action(move || {
                                 let mut s = store.lock().expect("inputs poisoned");
+                                let mut p = pending.lock().expect("pending queue poisoned");
+                                let mut ctx = ActionContext {
+                                    store: &mut s,
+                                    defaults: &defaults,
+                                    pending_events: &mut p,
+                                };
                                 for op in &ops {
-                                    op.apply(&mut s);
+                                    op.apply(&mut ctx);
                                 }
                             });
                         }
@@ -578,6 +707,8 @@ impl LottieStateMachine {
             event_names,
             state_segments,
             inputs,
+            defaults,
+            pending_events,
             tween_edges,
             tween: None,
         })
@@ -591,6 +722,8 @@ impl LottieStateMachine {
             event_names: HashMap::new(),
             state_segments: HashMap::new(),
             inputs: Arc::new(Mutex::new(InputStore::default())),
+            defaults: Arc::new(InputDefaults::default()),
+            pending_events: Arc::new(Mutex::new(Vec::new())),
             tween_edges: HashMap::new(),
             tween: None,
         }
@@ -640,6 +773,30 @@ impl LottieStateMachine {
         s.boolean.get(name).copied()
     }
 
+    /// Restore `name` to the value the spec's top-level `inputs`
+    /// array declared for it, or clear it entirely when no default
+    /// was declared. Same semantics as a `Reset` action firing
+    /// from a transition — useful for host code driving lifecycle
+    /// resets outside the FSM's own event flow.
+    pub fn reset_input(&mut self, name: &str) {
+        let mut s = self.inputs.lock().expect("inputs poisoned");
+        if let Some(v) = self.defaults.numeric.get(name) {
+            s.numeric.insert(name.to_string(), *v);
+        } else {
+            s.numeric.remove(name);
+        }
+        if let Some(v) = self.defaults.string.get(name) {
+            s.string.insert(name.to_string(), v.clone());
+        } else {
+            s.string.remove(name);
+        }
+        if let Some(v) = self.defaults.boolean.get(name) {
+            s.boolean.insert(name.to_string(), *v);
+        } else {
+            s.boolean.remove(name);
+        }
+    }
+
     /// Borrow the inner player (for `Player` trait calls: `draw_at`,
     /// `duration`, etc.).
     pub fn player(&self) -> &LottiePlayer {
@@ -674,15 +831,45 @@ impl LottieStateMachine {
     /// call (to capture an accurate starting `t`) and runs for the
     /// authored `duration` seconds, easing along the authored cubic
     /// bezier if present.
+    ///
+    /// Any `Fire` actions the firing edge carries enqueue events
+    /// into a pending buffer; this method drains them after the
+    /// edge completes, cascading up to [`MAX_CASCADE_DEPTH`] hops
+    /// before bailing. The return value reflects the *initial*
+    /// state change — cascades beyond that contribute to the
+    /// machine's state but not the return value.
     pub fn send(&mut self, event_name: &str) -> bool {
         let Some(&event_id) = self.event_names.get(event_name) else {
             return false;
         };
+        let changed = self.dispatch(event_id);
+        // Drain the cascade queue. Fire actions appended onto the
+        // queue while the above edge fired now dispatch in
+        // insertion order. Cap at MAX_CASCADE_DEPTH to keep authored
+        // cycles (A→fire(evt)→A) from spinning forever.
+        let mut drained = 0usize;
+        loop {
+            let next = {
+                let mut q = self.pending_events.lock().expect("pending queue poisoned");
+                if q.is_empty() || drained >= MAX_CASCADE_DEPTH {
+                    q.clear();
+                    break;
+                }
+                q.remove(0)
+            };
+            drained += 1;
+            self.dispatch(next);
+        }
+        changed
+    }
+
+    /// Single-edge dispatch: run the FSM for `event_id`, apply the
+    /// destination segment on state change, and arm a tween if the
+    /// edge came from a `Tweened` transition. Shared between the
+    /// primary `send()` call and the `Fire`-cascade drain loop so
+    /// cascaded events get tween arming + segment updates too.
+    fn dispatch(&mut self, event_id: EventId) -> bool {
         let prev = self.fsm.current_state();
-        // Snapshot the source pose *before* the transition fires —
-        // after `fsm.send` + `apply_state_segment`, the player's
-        // clock has been rebound to the destination segment, so
-        // `last_scene_t()` would read a fresh value.
         let from_scene_t = self.player.last_scene_t();
         let from_segment = self.player.segment();
         let next = self.fsm.send(event_id);
@@ -691,10 +878,6 @@ impl LottieStateMachine {
         }
         apply_state_segment(&mut self.player, next, &self.state_segments);
         if let Some(params) = self.tween_edges.get(&(event_id, prev)) {
-            // Guard: only arm the tween if the FSM actually landed
-            // on the target we recorded. A Tweened transition with
-            // a failing non-Event guard takes a different edge
-            // (if any) — the crossfade would be wrong.
             if params.to_state == next && params.duration > 0.0 {
                 self.tween = Some(Tween {
                     from_segment,
@@ -948,9 +1131,12 @@ impl Condition {
     }
 }
 
-/// Compiled transition action. `Fire` and `Reset` parse but don't
-/// execute — see their `ActionSpec` docs for why — so they don't
-/// produce an `ActionOp`.
+/// Compiled transition action. `Fire` compiles only when the
+/// referenced event name is registered in the pre-scan pass; an
+/// un-matchable `Fire` still parses but drops here so it can't
+/// stall the action queue. `Reset` needs just the input name +
+/// kind — the actual default comes from the shared
+/// [`InputDefaults`] snapshot at apply time.
 #[derive(Debug, Clone)]
 enum ActionOp {
     SetNumeric { name: String, value: f64 },
@@ -959,10 +1145,17 @@ enum ActionOp {
     Toggle { name: String },
     Increment { name: String, value: f64 },
     Decrement { name: String, value: f64 },
+    /// Queue an event for cascaded dispatch after the current
+    /// transition completes. `send()` drains the queue in
+    /// insertion order.
+    Fire { event: EventId },
+    /// Restore an input to its author-declared default, or clear
+    /// it entirely when no default was declared.
+    Reset { name: String },
 }
 
 impl ActionOp {
-    fn from_spec(spec: &ActionSpec) -> Option<Self> {
+    fn from_spec(spec: &ActionSpec, event_names: &HashMap<String, EventId>) -> Option<Self> {
         match spec {
             ActionSpec::SetNumeric { input_name, value } => Some(Self::SetNumeric {
                 name: input_name.clone(),
@@ -987,32 +1180,65 @@ impl ActionOp {
                 name: input_name.clone(),
                 value: *value,
             }),
-            ActionSpec::Fire { .. } | ActionSpec::Reset { .. } | ActionSpec::Unsupported => None,
+            ActionSpec::Fire { input_name } => event_names
+                .get(input_name)
+                .copied()
+                .map(|event| Self::Fire { event }),
+            ActionSpec::Reset { input_name } => Some(Self::Reset {
+                name: input_name.clone(),
+            }),
+            ActionSpec::Unsupported => None,
         }
     }
 
-    fn apply(&self, store: &mut InputStore) {
+    fn apply(&self, ctx: &mut ActionContext<'_>) {
         match self {
             ActionOp::SetNumeric { name, value } => {
-                store.numeric.insert(name.clone(), *value);
+                ctx.store.numeric.insert(name.clone(), *value);
             }
             ActionOp::SetString { name, value } => {
-                store.string.insert(name.clone(), value.clone());
+                ctx.store.string.insert(name.clone(), value.clone());
             }
             ActionOp::SetBoolean { name, value } => {
-                store.boolean.insert(name.clone(), *value);
+                ctx.store.boolean.insert(name.clone(), *value);
             }
             ActionOp::Toggle { name } => {
-                let entry = store.boolean.entry(name.clone()).or_insert(false);
+                let entry = ctx.store.boolean.entry(name.clone()).or_insert(false);
                 *entry = !*entry;
             }
             ActionOp::Increment { name, value } => {
-                let entry = store.numeric.entry(name.clone()).or_insert(0.0);
+                let entry = ctx.store.numeric.entry(name.clone()).or_insert(0.0);
                 *entry += *value;
             }
             ActionOp::Decrement { name, value } => {
-                let entry = store.numeric.entry(name.clone()).or_insert(0.0);
+                let entry = ctx.store.numeric.entry(name.clone()).or_insert(0.0);
                 *entry -= *value;
+            }
+            ActionOp::Fire { event } => {
+                ctx.pending_events.push(*event);
+            }
+            ActionOp::Reset { name } => {
+                // "Reset to what?" — the author-declared default if
+                // there was one, otherwise drop the key so future
+                // reads surface the unseeded value (0.0 / "" /
+                // false). Reset walks all three kinds because the
+                // same name *could* appear in multiple maps; in
+                // practice it's almost always one kind.
+                if let Some(v) = ctx.defaults.numeric.get(name) {
+                    ctx.store.numeric.insert(name.clone(), *v);
+                } else {
+                    ctx.store.numeric.remove(name);
+                }
+                if let Some(v) = ctx.defaults.string.get(name) {
+                    ctx.store.string.insert(name.clone(), v.clone());
+                } else {
+                    ctx.store.string.remove(name);
+                }
+                if let Some(v) = ctx.defaults.boolean.get(name) {
+                    ctx.store.boolean.insert(name.clone(), *v);
+                } else {
+                    ctx.store.boolean.remove(name);
+                }
             }
         }
     }
@@ -1457,6 +1683,172 @@ mod tests {
         assert_eq!(sm.get_numeric("value"), Some(42.0));
         assert_eq!(sm.get_boolean("flag"), Some(true));
         assert_eq!(sm.get_numeric("count"), Some(13.0));
+    }
+
+    #[test]
+    fn top_level_inputs_seed_the_store_at_load() {
+        // `inputs` array at the spec root declares author defaults.
+        // The input store sees those values immediately and guards
+        // evaluate against them without host setup.
+        let spec = r#"{
+            "initial": "a",
+            "inputs": [
+                { "type": "Numeric", "name": "counter", "value": 6.0 },
+                { "type": "String",  "name": "role",    "value": "admin" },
+                { "type": "Boolean", "name": "ready",   "value": true }
+            ],
+            "states": [
+                {
+                    "type": "PlaybackState",
+                    "name": "a",
+                    "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition",
+                            "toState": "b",
+                            "guards": [
+                                { "type": "Event", "inputName": "go" },
+                                { "type": "Numeric", "inputName": "counter",
+                                  "conditionType": "GreaterThan", "compareTo": 5.0 }
+                            ]
+                        }
+                    ]
+                },
+                { "type": "PlaybackState", "name": "b", "animation": "main" }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        // Seeds are visible before any host interaction.
+        assert_eq!(sm.get_numeric("counter"), Some(6.0));
+        assert_eq!(sm.get_string("role"), Some("admin".to_string()));
+        assert_eq!(sm.get_boolean("ready"), Some(true));
+        // Guard passes because the seed already places counter above
+        // the threshold.
+        assert!(sm.send("go"));
+        assert_eq!(sm.current_state_name(), "b");
+    }
+
+    #[test]
+    fn reset_action_restores_declared_defaults() {
+        // `counter` has an author-declared default of 3. After a
+        // SetNumeric action overwrites it to 99, a Reset action on a
+        // follow-up transition should bring it back to 3, not to 0.
+        let spec = r#"{
+            "initial": "a",
+            "inputs": [
+                { "type": "Numeric", "name": "counter", "value": 3.0 }
+            ],
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition", "toState": "b",
+                            "guards": [{ "type": "Event", "inputName": "go" }],
+                            "actions": [
+                                { "type": "SetNumeric", "inputName": "counter", "value": 99.0 }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "type": "PlaybackState", "name": "b", "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition", "toState": "a",
+                            "guards": [{ "type": "Event", "inputName": "back" }],
+                            "actions": [
+                                { "type": "Reset", "inputName": "counter" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert_eq!(sm.get_numeric("counter"), Some(3.0));
+        assert!(sm.send("go"));
+        assert_eq!(sm.get_numeric("counter"), Some(99.0));
+        assert!(sm.send("back"));
+        assert_eq!(sm.get_numeric("counter"), Some(3.0), "reset should restore default");
+
+        // Reset on an undeclared input clears it — no phantom zero.
+        sm.set_numeric("adhoc", 5.0);
+        sm.reset_input("adhoc");
+        assert_eq!(sm.get_numeric("adhoc"), None);
+    }
+
+    #[test]
+    fn fire_action_cascades_events_serially() {
+        // `kick` fires the `chain` event; the `chain` transition
+        // advances to the final state. One `send("kick")` should
+        // land on `c` even though the author wrote two separate
+        // transitions.
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition", "toState": "b",
+                            "guards": [{ "type": "Event", "inputName": "kick" }],
+                            "actions": [
+                                { "type": "Fire", "inputName": "chain" }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "type": "PlaybackState", "name": "b", "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition", "toState": "c",
+                            "guards": [{ "type": "Event", "inputName": "chain" }]
+                        }
+                    ]
+                },
+                { "type": "PlaybackState", "name": "c", "animation": "main" }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert!(sm.send("kick"));
+        assert_eq!(sm.current_state_name(), "c", "cascade should land on final state");
+    }
+
+    #[test]
+    fn fire_cascade_bails_on_author_cycle() {
+        // Author wrote a self-loop via Fire — `loop` fires `loop`
+        // again. Without the depth cap we'd spin forever; with it,
+        // the cascade stops after MAX_CASCADE_DEPTH hops leaving
+        // the machine alive (no panic, no infinite loop).
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition", "toState": "a",
+                            "guards": [{ "type": "Event", "inputName": "loop" }],
+                            "actions": [
+                                { "type": "Fire", "inputName": "loop" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        // A self-loop target is `prev == next`, so `dispatch` reports
+        // `false` even though the FSM ticked through the edge. What
+        // matters is that `send` returns without hanging.
+        let _ = sm.send("loop");
+        assert_eq!(sm.current_state_name(), "a");
     }
 
     #[test]

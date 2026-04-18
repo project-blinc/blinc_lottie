@@ -214,18 +214,26 @@ it.
     `speed`, `autoplay`; `mode` other than Forward.
 
   Follow-ups still on the table:
-  - `Fire` action (cascading `send()` — needs a deferred event
-    queue so the FSM can finish the current edge before
-    dispatching the next).
-  - `Reset` action (needs an initial-values table captured at load
-    so "reset to what?" has a defined answer).
   - Per-state playback modifiers: `loop: false`, `loopCount`,
     `speed`, `Reverse` / `Bounce` / `ReverseBounce` modes.
-  - Top-level `inputs[]` seed values at load (current host code
-    seeds via `set_numeric` / `set_string` / `set_boolean`).
   - Animated-segment markers (`"marker": "<name>"` pointing at a
     Lottie marker instead of explicit `[start, end]` frames).
   - Image-asset extraction from the archive for raster layers.
+
+- [x] **State machine `Fire` / `Reset` + top-level `inputs[]` seeding** — shipped.
+  Top-level `inputs` array is parsed into a typed
+  `InputSpec::{Numeric|String|Boolean}` enum and seeds the shared
+  `InputStore` at load so guards evaluate against author defaults
+  without host setup. A snapshot of those same values (`InputDefaults`)
+  backs the `Reset` action — resetting an input returns it to the
+  declared default, or clears the key entirely when none was
+  declared. Also exposed `reset_input` on `LottieStateMachine`
+  for host-side lifecycle resets.
+  `Fire` actions enqueue into a deferred `Vec<EventId>` shared
+  with the FSM's action closures; `send()` drains the queue
+  after the originating edge completes so cascades dispatch
+  serially without re-entering the FSM. Cap at `MAX_CASCADE_DEPTH`
+  (32 hops) bails out of authored cycles (A → fire(A)).
 
 - [ ] **Keyframe lookup acceleration**
   - **Why:** `sample_*` does a linear scan per property per frame. Fine
