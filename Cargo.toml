@@ -26,3 +26,23 @@ serde_json = "1.0"
 
 # Error plumbing.
 thiserror = "2.0"
+
+# Local-dev patch — mirrors the Blinc workspace root so indirect
+# git-rev deps (e.g. blinc_canvas_kit → blinc_input → old Blinc
+# `blinc_layout`) collapse onto the path-dep versions above.
+# Without this, a `capture_input` from the git-fetched
+# blinc_input resolves `DivInputExt: impl for Div` against a
+# *different* `Div` type than the path-dep blinc_layout exports,
+# producing "method not found in `blinc_layout::Div`" against
+# what looks like the right trait in scope.
+#
+# Drop this block when blinc_lottie moves to crates.io — published
+# semver resolution will unify versions on its own.
+[patch."https://github.com/project-blinc/Blinc.git"]
+blinc_core = { path = "../../crates/blinc_core" }
+blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
+blinc_layout = { path = "../../crates/blinc_layout" }
+blinc_platform = { path = "../../crates/blinc_platform" }
+
+[patch."https://github.com/project-blinc/blinc_input.git"]
+blinc_input = { path = "../blinc_input" }

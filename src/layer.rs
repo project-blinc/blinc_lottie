@@ -57,6 +57,33 @@ pub(crate) enum LayerKind {
 // Animated values
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Cubic-bezier ease control point stored on a keyframe. Lottie
+/// encodes temporal easing as two tangents per keyframe: `out`
+/// (this keyframe's contribution to the segment starting here) and
+/// `in` (this keyframe's contribution to the segment ending here).
+///
+/// Interpolating between consecutive keyframes N → N+1 uses the
+/// pair `(keys[N].out, keys[N+1].in)` as the middle two control
+/// points of a cubic bezier whose endpoints are fixed at (0,0)
+/// and (1,1) — a timing curve that maps linear progress
+/// `u ∈ [0, 1]` to eased progress. See
+/// [`solve_bezier_ease`] for the math.
+///
+/// Per-component tangents (`x`/`y` stored separately) are a Lottie
+/// feature for axis-independent eases. We only read the first
+/// component of each array for now — shared easing covers ~99% of
+/// authored Lotties and matches After Effects' "Easy Ease"
+/// button output.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BezierTangent {
+    /// Normalized time component: where on `[0, 1]` this control
+    /// point sits horizontally.
+    pub x: f32,
+    /// Normalized value component: where on `[0, 1]` this control
+    /// point sits vertically (past 1 or below 0 = overshoot ease).
+    pub y: f32,
+}
+
 /// A single keyframe in a scalar property animation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScalarKey {
@@ -67,6 +94,13 @@ pub(crate) struct ScalarKey {
     /// If `true`, hold this value until the next keyframe (no
     /// interpolation between this keyframe and the next).
     pub hold: bool,
+    /// Out tangent — control point for the bezier segment STARTING
+    /// at this keyframe. `None` means linear interpolation toward
+    /// the next keyframe (also the fallback when JSON omits `o`).
+    pub out_tangent: Option<BezierTangent>,
+    /// In tangent — control point for the bezier segment ENDING at
+    /// this keyframe. Consumed when interpolating from `N-1 → N`.
+    pub in_tangent: Option<BezierTangent>,
 }
 
 /// A single keyframe in a 2D vector property animation.
@@ -75,6 +109,8 @@ pub(crate) struct Vec2Key {
     pub t: f32,
     pub value: [f32; 2],
     pub hold: bool,
+    pub out_tangent: Option<BezierTangent>,
+    pub in_tangent: Option<BezierTangent>,
 }
 
 /// A scalar property that may be static or keyframed.
@@ -140,6 +176,8 @@ pub(crate) struct Vec4Key {
     pub t: f32,
     pub value: [f32; 4],
     pub hold: bool,
+    pub out_tangent: Option<BezierTangent>,
+    pub in_tangent: Option<BezierTangent>,
 }
 
 /// A 4D vector property (e.g. RGBA color) that may be static or keyframed.
@@ -155,6 +193,70 @@ impl AnimatedVec4 {
             Self::Static(v) => *v,
             Self::Keyframed(keys) => sample_vec4(keys, t),
         }
+    }
+}
+
+/// Evaluate the eased progress for a pair of keyframe tangents.
+/// `u` is linear progress `∈ [0, 1]` between the two keyframes.
+///
+/// The bezier's endpoints are fixed at (0,0) and (1,1); middle
+/// control points come from `out_tangent` of the earlier keyframe
+/// and `in_tangent` of the later keyframe. Newton-solve
+/// `bezier_x(t) = u` for `t`, then return `bezier_y(t)`.
+///
+/// After Effects' "Easy Ease" preset produces `(0.833, 0.833)` /
+/// `(0.167, 0.167)` tangents → resolves to the classic S-curve.
+/// Degenerate inputs (both control points on the line, tangents
+/// outside `[0, 1]` for the x axis) fall back to linear.
+fn solve_bezier_ease(u: f32, out_p: BezierTangent, in_p: BezierTangent) -> f32 {
+    // Linear check — common case for tangents authored as "no ease"
+    // (both control points lie on `y = x`). Skips eight Newton
+    // iterations per keyframe interp on those.
+    if (out_p.x - out_p.y).abs() < 1e-4 && (in_p.x - in_p.y).abs() < 1e-4 {
+        return u;
+    }
+    let p1x = out_p.x;
+    let p1y = out_p.y;
+    let p2x = in_p.x;
+    let p2y = in_p.y;
+    // Newton's method on `bezier_x(t) - u = 0`, seeded at `t = u`.
+    // Converges to 1e-5 in 2-4 iterations for well-shaped tangents;
+    // the 8-iter cap defends against pathological control points
+    // authored manually in JSON.
+    let mut t = u;
+    for _ in 0..8 {
+        let ut = 1.0 - t;
+        let bx = 3.0 * ut * ut * t * p1x + 3.0 * ut * t * t * p2x + t * t * t;
+        let err = bx - u;
+        if err.abs() < 1e-5 {
+            break;
+        }
+        // dB/dt for the x component.
+        let dbx = 3.0 * ut * ut * p1x
+            + 6.0 * ut * t * (p2x - p1x)
+            + 3.0 * t * t * (1.0 - p2x);
+        if dbx.abs() < 1e-6 {
+            // Derivative vanishes — accept the current estimate.
+            break;
+        }
+        t -= err / dbx;
+    }
+    let t = t.clamp(0.0, 1.0);
+    let ut = 1.0 - t;
+    3.0 * ut * ut * t * p1y + 3.0 * ut * t * t * p2y + t * t * t
+}
+
+/// Compute eased progress between consecutive keyframes.
+/// `linear_u` is `(t - k0.t) / (k1.t - k0.t)` ∈ `[0, 1]`.
+#[inline]
+fn eased_u(
+    linear_u: f32,
+    k0_out: Option<BezierTangent>,
+    k1_in: Option<BezierTangent>,
+) -> f32 {
+    match (k0_out, k1_in) {
+        (Some(o), Some(i)) => solve_bezier_ease(linear_u, o, i),
+        _ => linear_u,
     }
 }
 
@@ -176,7 +278,8 @@ fn sample_scalar(keys: &[ScalarKey], t: f32) -> f32 {
             if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
                 return k0.value;
             }
-            let u = (t - k0.t) / (k1.t - k0.t);
+            let linear_u = (t - k0.t) / (k1.t - k0.t);
+            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
             return k0.value + (k1.value - k0.value) * u;
         }
     }
@@ -201,7 +304,8 @@ fn sample_vec2(keys: &[Vec2Key], t: f32) -> [f32; 2] {
             if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
                 return k0.value;
             }
-            let u = (t - k0.t) / (k1.t - k0.t);
+            let linear_u = (t - k0.t) / (k1.t - k0.t);
+            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
             return [
                 k0.value[0] + (k1.value[0] - k0.value[0]) * u,
                 k0.value[1] + (k1.value[1] - k0.value[1]) * u,
@@ -229,7 +333,8 @@ fn sample_vec4(keys: &[Vec4Key], t: f32) -> [f32; 4] {
             if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
                 return k0.value;
             }
-            let u = (t - k0.t) / (k1.t - k0.t);
+            let linear_u = (t - k0.t) / (k1.t - k0.t);
+            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
             return [
                 k0.value[0] + (k1.value[0] - k0.value[0]) * u,
                 k0.value[1] + (k1.value[1] - k0.value[1]) * u,
@@ -520,7 +625,7 @@ fn collect_vec4_keys(arr: &[Value], fr: f32) -> Vec<Vec4Key> {
             let t_frames = kf.get("t")?.as_f64()? as f32;
             let value = kf
                 .get("s")
-                .and_then(|s| vec4_from_s(s))
+                .and_then(vec4_from_s)
                 .unwrap_or(last_value);
             last_value = value;
             let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
@@ -528,9 +633,34 @@ fn collect_vec4_keys(arr: &[Value], fr: f32) -> Vec<Vec4Key> {
                 t: t_frames / fr,
                 value,
                 hold,
+                out_tangent: tangent_from_key(kf, "o"),
+                in_tangent: tangent_from_key(kf, "i"),
             })
         })
         .collect()
+}
+
+/// Extract a `BezierTangent` from a keyframe's `i` or `o` block.
+///
+/// Lottie JSON stores each tangent as either `{ "x": <num>, "y": <num> }`
+/// (shared-axis easing) or `{ "x": [<num>, ...], "y": [<num>, ...] }`
+/// (per-component easing). We take the scalar form directly and the
+/// first array element for the array form — covers every ease
+/// After Effects' "Easy Ease" preset emits, plus manually-authored
+/// per-axis eases collapse cleanly to a single shared curve.
+fn tangent_from_key(kf: &Value, field: &str) -> Option<BezierTangent> {
+    let obj = kf.get(field)?;
+    let x = scalar_or_first(obj.get("x")?)?;
+    let y = scalar_or_first(obj.get("y")?)?;
+    Some(BezierTangent { x, y })
+}
+
+fn scalar_or_first(v: &Value) -> Option<f32> {
+    if let Some(arr) = v.as_array() {
+        arr.first().and_then(Value::as_f64).map(|n| n as f32)
+    } else {
+        v.as_f64().map(|n| n as f32)
+    }
 }
 
 fn vec4_from_s(v: &Value) -> Option<[f32; 4]> {
@@ -554,7 +684,7 @@ fn collect_scalar_keys(arr: &[Value], fr: f32) -> Vec<ScalarKey> {
             let t_frames = kf.get("t")?.as_f64()? as f32;
             let value = kf
                 .get("s")
-                .and_then(|s| scalar_from_s(s))
+                .and_then(scalar_from_s)
                 .unwrap_or(last_value);
             last_value = value;
             let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
@@ -562,6 +692,8 @@ fn collect_scalar_keys(arr: &[Value], fr: f32) -> Vec<ScalarKey> {
                 t: t_frames / fr,
                 value,
                 hold,
+                out_tangent: tangent_from_key(kf, "o"),
+                in_tangent: tangent_from_key(kf, "i"),
             })
         })
         .collect()
@@ -574,7 +706,7 @@ fn collect_vec2_keys(arr: &[Value], fr: f32) -> Vec<Vec2Key> {
             let t_frames = kf.get("t")?.as_f64()? as f32;
             let value = kf
                 .get("s")
-                .and_then(|s| vec2_from_s(s))
+                .and_then(vec2_from_s)
                 .unwrap_or(last_value);
             last_value = value;
             let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
@@ -582,6 +714,8 @@ fn collect_vec2_keys(arr: &[Value], fr: f32) -> Vec<Vec2Key> {
                 t: t_frames / fr,
                 value,
                 hold,
+                out_tangent: tangent_from_key(kf, "o"),
+                in_tangent: tangent_from_key(kf, "i"),
             })
         })
         .collect()

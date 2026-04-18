@@ -189,7 +189,7 @@ impl Geometry {
 /// Uses the standard 4-arc construction with `k = (4/3)·tan(π/8)` for
 /// the control-point distance.
 fn ellipse_path(cx: f32, cy: f32, rx: f32, ry: f32) -> Path {
-    const K: f32 = 0.552_284_75;
+    const K: f32 = 0.552_284_7;
     let kx = rx * K;
     let ky = ry * K;
     Path::new()
