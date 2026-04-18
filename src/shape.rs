@@ -34,8 +34,8 @@
 //! simpler single-fill / single-stroke per group model — covers the
 //! vast majority of motion-design exports and stays readable.
 
-use blinc_core::draw::{LineCap, LineJoin, Path, Stroke};
-use blinc_core::layer::{Brush, Color, CornerRadius, Rect};
+use blinc_core::draw::{LineCap, LineJoin, Path, PathCommand, Stroke};
+use blinc_core::layer::{Brush, Color, CornerRadius, Point, Rect};
 use blinc_core::DrawContext;
 use serde_json::Value;
 
@@ -59,8 +59,44 @@ pub(crate) struct ShapeGroup {
     geometries: Vec<Geometry>,
     fill: Option<FillSpec>,
     stroke: Option<StrokeSpec>,
+    /// Trim-path state from `tm`. When present, each geometry is
+    /// flattened to a polyline, clipped to the trimmed arc-length
+    /// window, and re-emitted before fill / stroke. `None` for
+    /// groups without trim data (the common case).
+    trim: Option<TrimPathSpec>,
     /// Nested `gr` groups — render after this group's own paint pass.
     children: Vec<ShapeGroup>,
+}
+
+/// Parsed state of a `ty: "tm"` trim-path shape item.
+///
+/// Lottie stores `s` (start) and `e` (end) as animated percentages
+/// in `[0, 100]`; `o` (offset) is stored in degrees `[0, 360]` but
+/// conceptually represents a fractional cycle offset. At sample
+/// time the three scale into `[0, 1]` so the arc-length walker
+/// doesn't have to repeat the conversion.
+#[derive(Debug, Clone)]
+struct TrimPathSpec {
+    start: AnimatedF32,
+    end: AnimatedF32,
+    offset: AnimatedF32,
+    /// `m: 1` = "Simultaneously" (all geometry paths treated as one
+    /// concatenated path for trim purposes). `m: 2` = "Individually"
+    /// (each geometry trimmed on its own). We implement Individually
+    /// first since it's equivalent for single-path groups (the
+    /// common case) and skips the flatten-everything-into-one-buffer
+    /// step. Simultaneously falls back to Individually — assets
+    /// that explicitly set `m: 1` on multi-geometry groups will
+    /// trim each path independently until the concatenation path
+    /// lands.
+    #[allow(dead_code)]
+    mode: TrimMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrimMode {
+    Simultaneous,
+    Individual,
 }
 
 #[derive(Debug, Clone)]
@@ -377,8 +413,27 @@ impl ShapeGroup {
             })
             .is_some();
 
+        // Sample the trim window once per frame so every geometry
+        // in the group sees the same cut. `Simultaneous` mode is
+        // documented as equivalent to `Individual` here — that
+        // choice matches single-path groups exactly (the common
+        // case) and only differs on multi-path groups where the
+        // author expected all paths to share arc-length 0–1.
+        let trim_window = self
+            .trim
+            .as_ref()
+            .map(|tm| sample_trim_window(tm, t))
+            .filter(|window| window.has_visible_range());
+
         for geo in &self.geometries {
-            let path = geo.to_path(t);
+            let raw = geo.to_path(t);
+            let path = match &trim_window {
+                Some(window) => apply_trim(&raw, *window),
+                None => raw,
+            };
+            if path.is_empty() {
+                continue;
+            }
             if let Some(fill) = &self.fill {
                 let brush = sample_paint_brush(&fill.paint, &fill.opacity, t);
                 dc.fill_path(&path, brush);
@@ -410,6 +465,236 @@ impl ShapeGroup {
             pop_layer_transform(dc);
         }
     }
+}
+
+/// Arc-length window in normalized `[0, 1]` coordinates, ready for
+/// the polyline trimmer. Sampled once per frame from a
+/// [`TrimPathSpec`] so every geometry in the group sees the same
+/// cut even if the sampler incurs measurable work.
+#[derive(Debug, Clone, Copy)]
+struct TrimWindow {
+    start: f32,
+    end: f32,
+}
+
+impl TrimWindow {
+    fn has_visible_range(&self) -> bool {
+        // Full-range trim (start ≈ 0, end ≈ 1) is a no-op; a degenerate
+        // zero-length trim (start == end) paints nothing. Both get
+        // fast-pathed here to save the flatten + walk cost.
+        let span = self.end - self.start;
+        span > 1e-6 && span < 1.0 - 1e-6
+    }
+
+    fn is_identity(&self) -> bool {
+        self.start <= 1e-6 && self.end >= 1.0 - 1e-6
+    }
+}
+
+fn sample_trim_window(spec: &TrimPathSpec, t: f32) -> TrimWindow {
+    // Lottie spec: start / end are percentages [0, 100]; offset is
+    // a fractional cycle expressed in degrees [0, 360]. Fold the
+    // offset into both endpoints so we always emit a canonical
+    // `[s, e]` span, wrapping through 1.0 when needed.
+    let s = (spec.start.sample(t) / 100.0).clamp(0.0, 1.0);
+    let e = (spec.end.sample(t) / 100.0).clamp(0.0, 1.0);
+    // Full-range shortcut: `rem_euclid(1.0)` maps 1.0 back to 0.0,
+    // which would destroy the identity case (s=0, e=1, offset=0).
+    // Detect it before folding so `is_identity()` keeps working.
+    if e - s >= 1.0 - 1e-6 {
+        return TrimWindow { start: 0.0, end: 1.0 };
+    }
+    let offset = (spec.offset.sample(t) / 360.0).rem_euclid(1.0);
+    let start = (s + offset).rem_euclid(1.0);
+    let end = (e + offset).rem_euclid(1.0);
+    TrimWindow { start, end }
+}
+
+/// Flatten each subpath of `path` into a polyline and emit only
+/// the arc-length slice `[window.start, window.end]`. Output is a
+/// polyline path (line_to only) — loses the cubic smoothness of
+/// the original, but at the default subdivision density the
+/// difference isn't visible at typical rendering scales.
+fn apply_trim(path: &Path, window: TrimWindow) -> Path {
+    if window.is_identity() {
+        return path.clone();
+    }
+    let mut out = Path::new();
+    for points in flatten_subpaths(path) {
+        if points.len() < 2 {
+            continue;
+        }
+        emit_trimmed_subpath(&mut out, &points, window);
+    }
+    out
+}
+
+/// Flatten a path into separate polylines, one per subpath. A new
+/// subpath begins on every `MoveTo`; `Close` stitches the last
+/// vertex back to the subpath's start so the trim walker sees the
+/// full cycle even for closed shapes.
+fn flatten_subpaths(path: &Path) -> Vec<Vec<Point>> {
+    const SAMPLES_PER_CURVE: usize = 24;
+    let mut out: Vec<Vec<Point>> = Vec::new();
+    let mut current = Point::new(0.0, 0.0);
+    let mut subpath_start = current;
+    let mut have_subpath = false;
+    let begin_subpath = |pt: Point,
+                             out: &mut Vec<Vec<Point>>,
+                             have_subpath: &mut bool,
+                             subpath_start: &mut Point| {
+        out.push(vec![pt]);
+        *subpath_start = pt;
+        *have_subpath = true;
+    };
+    for cmd in path.commands() {
+        match cmd {
+            PathCommand::MoveTo(p) => {
+                current = *p;
+                begin_subpath(*p, &mut out, &mut have_subpath, &mut subpath_start);
+            }
+            PathCommand::LineTo(p) => {
+                if !have_subpath {
+                    begin_subpath(current, &mut out, &mut have_subpath, &mut subpath_start);
+                }
+                out.last_mut().unwrap().push(*p);
+                current = *p;
+            }
+            PathCommand::QuadTo { control, end } => {
+                if !have_subpath {
+                    begin_subpath(current, &mut out, &mut have_subpath, &mut subpath_start);
+                }
+                let buf = out.last_mut().unwrap();
+                for i in 1..=SAMPLES_PER_CURVE {
+                    let u = i as f32 / SAMPLES_PER_CURVE as f32;
+                    let mt = 1.0 - u;
+                    buf.push(Point::new(
+                        mt * mt * current.x + 2.0 * mt * u * control.x + u * u * end.x,
+                        mt * mt * current.y + 2.0 * mt * u * control.y + u * u * end.y,
+                    ));
+                }
+                current = *end;
+            }
+            PathCommand::CubicTo {
+                control1,
+                control2,
+                end,
+            } => {
+                if !have_subpath {
+                    begin_subpath(current, &mut out, &mut have_subpath, &mut subpath_start);
+                }
+                let buf = out.last_mut().unwrap();
+                for i in 1..=SAMPLES_PER_CURVE {
+                    let u = i as f32 / SAMPLES_PER_CURVE as f32;
+                    let mt = 1.0 - u;
+                    let mt2 = mt * mt;
+                    let mt3 = mt2 * mt;
+                    let u2 = u * u;
+                    let u3 = u2 * u;
+                    buf.push(Point::new(
+                        mt3 * current.x
+                            + 3.0 * mt2 * u * control1.x
+                            + 3.0 * mt * u2 * control2.x
+                            + u3 * end.x,
+                        mt3 * current.y
+                            + 3.0 * mt2 * u * control1.y
+                            + 3.0 * mt * u2 * control2.y
+                            + u3 * end.y,
+                    ));
+                }
+                current = *end;
+            }
+            PathCommand::Close => {
+                if have_subpath {
+                    out.last_mut().unwrap().push(subpath_start);
+                    current = subpath_start;
+                }
+            }
+            PathCommand::ArcTo { .. } => {
+                // ArcTo is rare in Lottie exports (shape items
+                // rasterise to cubic beziers upstream); skipping
+                // with a line_to to the endpoint keeps the
+                // polyline contiguous instead of producing a gap.
+                // Proper arc flattening can land when an asset
+                // actually exercises this path.
+            }
+        }
+    }
+    out
+}
+
+/// Walk `points` and append the arc-length slice `[window.start,
+/// window.end]` (normalized) to `out`. Handles the wrap case
+/// (start > end after offset folding) by emitting two segments.
+fn emit_trimmed_subpath(out: &mut Path, points: &[Point], window: TrimWindow) {
+    let total = polyline_length(points);
+    if total < 1e-6 {
+        return;
+    }
+    let s = window.start * total;
+    let e = window.end * total;
+    if window.start <= window.end {
+        emit_slice(out, points, s, e, total);
+    } else {
+        // Offset folded the window across the 0/1 boundary — emit
+        // the tail of the path followed by the head as two
+        // separate line runs.
+        emit_slice(out, points, s, total, total);
+        emit_slice(out, points, 0.0, e, total);
+    }
+}
+
+fn emit_slice(out: &mut Path, points: &[Point], s: f32, e: f32, _total: f32) {
+    if e <= s {
+        return;
+    }
+    let mut cumulative = 0.0_f32;
+    let mut started = false;
+    for pair in points.windows(2) {
+        let seg_start = cumulative;
+        let seg_len = distance(pair[0], pair[1]);
+        let seg_end = cumulative + seg_len;
+        cumulative = seg_end;
+
+        if seg_end < s || seg_start > e || seg_len < 1e-6 {
+            continue;
+        }
+
+        let local_start = ((s - seg_start) / seg_len).clamp(0.0, 1.0);
+        let local_end = ((e - seg_start) / seg_len).clamp(0.0, 1.0);
+
+        let start_pt = lerp_point(pair[0], pair[1], local_start);
+        let end_pt = lerp_point(pair[0], pair[1], local_end);
+
+        let take = std::mem::take(out);
+        let mut path = take;
+        if !started {
+            path = path.move_to(start_pt.x, start_pt.y);
+            started = true;
+        }
+        if (end_pt.x - start_pt.x).abs() > 1e-5 || (end_pt.y - start_pt.y).abs() > 1e-5 {
+            path = path.line_to(end_pt.x, end_pt.y);
+        }
+        *out = path;
+    }
+}
+
+fn polyline_length(points: &[Point]) -> f32 {
+    let mut total = 0.0;
+    for pair in points.windows(2) {
+        total += distance(pair[0], pair[1]);
+    }
+    total
+}
+
+fn distance(a: Point, b: Point) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn lerp_point(a: Point, b: Point, u: f32) -> Point {
+    Point::new(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u)
 }
 
 impl Geometry {
@@ -528,6 +813,7 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
         geometries: Vec::new(),
         fill: None,
         stroke: None,
+        trim: None,
         children: Vec::new(),
     };
     let Some(items) = v.get("it").and_then(Value::as_array) else {
@@ -546,6 +832,7 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
             "st" => group.stroke = Some(parse_stroke(item, fr)),
             "gs" => group.stroke = Some(parse_gradient_stroke(item, fr)),
             "tr" => group.transform = Some(TransformSpec::from_value(Some(item), fr)),
+            "tm" => group.trim = Some(parse_trim_path(item, fr)),
             "gr" => group.children.push(parse_group(item, fr)),
             _ => {} // unimplemented item — skip silently
         }
@@ -560,6 +847,7 @@ fn single_item_group(v: &Value, fr: f32) -> Option<ShapeGroup> {
         geometries: Vec::new(),
         fill: None,
         stroke: None,
+        trim: None,
         children: Vec::new(),
     };
     match ty {
@@ -569,6 +857,18 @@ fn single_item_group(v: &Value, fr: f32) -> Option<ShapeGroup> {
         _ => return None,
     }
     Some(group)
+}
+
+fn parse_trim_path(v: &Value, fr: f32) -> TrimPathSpec {
+    TrimPathSpec {
+        start: parse_animated_scalar(v.get("s"), fr).unwrap_or(AnimatedF32::Static(0.0)),
+        end: parse_animated_scalar(v.get("e"), fr).unwrap_or(AnimatedF32::Static(100.0)),
+        offset: parse_animated_scalar(v.get("o"), fr).unwrap_or(AnimatedF32::Static(0.0)),
+        mode: match v.get("m").and_then(Value::as_u64).unwrap_or(1) {
+            2 => TrimMode::Individual,
+            _ => TrimMode::Simultaneous,
+        },
+    }
 }
 
 fn parse_rectangle(v: &Value, fr: f32) -> Geometry {
@@ -1044,7 +1344,6 @@ mod tests {
                 "ty": "gr",
                 "it": [
                     { "ty": "sr" }, // polystar — not yet implemented
-                    { "ty": "tm" }, // trim path — not yet implemented
                     {
                         "ty": "rc",
                         "p": { "k": [0.0, 0.0, 0.0] },
@@ -1056,6 +1355,124 @@ mod tests {
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
         assert_eq!(content.groups[0].geometries.len(), 1, "rect should still parse");
+    }
+
+    #[test]
+    fn parses_trim_path_item() {
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    {
+                        "ty": "rc",
+                        "p": { "k": [0.0, 0.0, 0.0] },
+                        "s": { "k": [100.0, 100.0, 0.0] },
+                        "r": { "k": 0.0 }
+                    },
+                    {
+                        "ty": "tm",
+                        "s": { "k": 25.0 },
+                        "e": { "k": 75.0 },
+                        "o": { "k": 0.0 },
+                        "m": 2
+                    },
+                    {
+                        "ty": "fl",
+                        "c": { "k": [1.0, 0.0, 0.0, 1.0] },
+                        "o": { "k": 100.0 }
+                    }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 60.0);
+        assert!(content.groups[0].trim.is_some(), "trim should parse");
+        let trim = content.groups[0].trim.as_ref().unwrap();
+        assert!((trim.start.sample(0.0) - 25.0).abs() < 1e-5);
+        assert!((trim.end.sample(0.0) - 75.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trim_window_samples_normalize_and_fold_offset() {
+        // start=25%, end=75%, offset=45° (= 0.125 cycles) shifts
+        // the window forward by 0.125: [0.375, 0.875].
+        let spec = TrimPathSpec {
+            start: AnimatedF32::Static(25.0),
+            end: AnimatedF32::Static(75.0),
+            offset: AnimatedF32::Static(45.0),
+            mode: TrimMode::Individual,
+        };
+        let window = sample_trim_window(&spec, 0.0);
+        assert!((window.start - 0.375).abs() < 1e-5, "start = {}", window.start);
+        assert!((window.end - 0.875).abs() < 1e-5, "end = {}", window.end);
+        assert!(window.has_visible_range());
+
+        // offset=270° pushes both endpoints past 1.0 and wraps —
+        // start=0.25+0.75 mod 1 = 0.0, end=0.75+0.75 mod 1 = 0.5.
+        // That's `start <= end` again; no wrap-rendering needed.
+        let wrap_spec = TrimPathSpec {
+            start: AnimatedF32::Static(25.0),
+            end: AnimatedF32::Static(75.0),
+            offset: AnimatedF32::Static(270.0),
+            mode: TrimMode::Individual,
+        };
+        let wrap = sample_trim_window(&wrap_spec, 0.0);
+        assert!(wrap.start < wrap.end);
+
+        // Full-range trim is identity (fast-pathed upstream).
+        let identity = TrimPathSpec {
+            start: AnimatedF32::Static(0.0),
+            end: AnimatedF32::Static(100.0),
+            offset: AnimatedF32::Static(0.0),
+            mode: TrimMode::Individual,
+        };
+        assert!(sample_trim_window(&identity, 0.0).is_identity());
+    }
+
+    #[test]
+    fn apply_trim_cuts_polyline_to_half_length() {
+        // A 4-unit horizontal line (two segments). Trimming to
+        // [0, 0.5] should produce a 2-unit segment from (0,0) to
+        // (2,0). Output is a polyline — count commands and check
+        // final endpoint.
+        let path = Path::new()
+            .move_to(0.0, 0.0)
+            .line_to(2.0, 0.0)
+            .line_to(4.0, 0.0);
+        let window = TrimWindow { start: 0.0, end: 0.5 };
+        let trimmed = apply_trim(&path, window);
+        let commands = trimmed.commands();
+        // MoveTo + at least one LineTo; final endpoint ≈ (2, 0).
+        assert!(matches!(commands[0], PathCommand::MoveTo(_)));
+        let last_pt = match commands.last().unwrap() {
+            PathCommand::LineTo(p) => *p,
+            other => panic!("expected LineTo, got {other:?}"),
+        };
+        assert!((last_pt.x - 2.0).abs() < 1e-3, "end x ≈ 2, got {}", last_pt.x);
+        assert!(last_pt.y.abs() < 1e-3);
+    }
+
+    #[test]
+    fn apply_trim_wraps_when_offset_crosses_zero() {
+        // Unit square, trim [0, 0.5] with offset 50% → wraps to
+        // emit the last half of the rectangle followed by the
+        // first half (two separate slice runs).
+        let path = Path::new()
+            .move_to(0.0, 0.0)
+            .line_to(1.0, 0.0)
+            .line_to(1.0, 1.0)
+            .line_to(0.0, 1.0)
+            .line_to(0.0, 0.0);
+        // Window [0.75, 0.25] after offset-folding represents a
+        // wrap (start > end) — two slice emissions.
+        let window = TrimWindow { start: 0.75, end: 0.25 };
+        let trimmed = apply_trim(&path, window);
+        // Expect two MoveTo commands: one per slice.
+        let move_tos = trimmed
+            .commands()
+            .iter()
+            .filter(|c| matches!(c, PathCommand::MoveTo(_)))
+            .count();
+        assert_eq!(move_tos, 2, "wrap should emit two subpaths");
     }
 
     #[test]

@@ -57,14 +57,31 @@ it.
     vertex counts lerp per-vertex. Different vertex counts between
     keyframes are out of scope (rare, documented as unsupported).
 
-- [ ] **Trim paths (`tm`)**
-  - **Why:** "Drawn-on" and "progress arc" animations rely on this.
-  - **How:** `tm` carries animatable `s` (start %), `e` (end %),
-    `o` (offset %). At render, walk the group's path, parameterize by
-    arc length, emit only the `[s, e]` slice (mod 1.0 with offset).
-    Needs a path-length sampler — Blinc's Path doesn't expose one yet;
-    either compute locally (flatten to segments + cumulative length) or
-    contribute the helper upstream.
+- [x] **Trim paths (`tm`)** — shipped. `ShapeGroup.trim` carries
+  parsed start / end / offset animatable scalars. At render the
+  group flattens each geometry's cubic-bezier path into a polyline
+  (24 samples per curve), computes cumulative arc length, and
+  emits only the slice `[start + offset, end + offset]` back as a
+  polyline Path. Offset wrap (start > end after folding) produces
+  two separate slice emissions. Full-range and zero-range windows
+  fast-path to identity / skip to avoid the flatten cost. Mode
+  `m: 1` (Simultaneously) currently trims each geometry
+  individually rather than on the concatenation of all the group's
+  paths — equivalent for single-path groups (the common case),
+  differs on multi-path groups. Output is polyline — loses the
+  cubic smoothness of the original but is imperceptible at the
+  default 24-sample density.
+
+- [ ] **Trim paths — true Simultaneously (`m: 1`) + cubic output**
+  - **Why:** Multi-path groups with `m: 1` currently render with
+    per-geometry trim windows instead of the concatenation author
+    expected. Visual difference is clear only when the paths have
+    different arc lengths.
+  - **How:** Concatenate all group polylines into a single buffer,
+    compute one cumulative arc length, then emit slices. For cubic
+    output rather than polyline: track which original segments a
+    flattened sample came from and emit partial cubic beziers via
+    de Casteljau subdivision.
 
 ---
 
