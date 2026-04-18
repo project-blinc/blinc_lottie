@@ -145,41 +145,32 @@ it.
 
 ## Phase 5 — Format + performance
 
-- [ ] **dotLottie (`.lottie`)**
-  - **How:** Zip archive containing `animation.json` and assets. Add
-    a `zip` dep; `from_dotlottie_bytes(&[u8])` unpacks, loads the
-    JSON, and wires up any image assets.
+- [x] **dotLottie (`.lottie`)** — shipped in the same cycle as
+  state machines. `from_dotlottie_bytes(&[u8])` unpacks the zip,
+  returns `(animation_json, state_machine_json)`, and
+  `LottiePlayer::from_dotlottie_bytes` plugs into the existing
+  load path. Image-asset extraction is deferred; archives that
+  reference rasters via `assets[].p` render the vector content
+  correctly and skip the raster layers until Phase 4's image-
+  layer work lands.
 
-- [ ] **dotLottie state machines** — *depends on dotLottie archive*
-  - **Why:** dotLottie's spec extension beyond core Lottie JSON. Apps
-    ship one archive that defines named states (e.g. `idle`, `hover`,
-    `clicked`) where each state points at a segment of the master
-    animation, plus event-triggered transitions between states. Common
-    in Lottie-driven UI components (interactive icons, onboarding
-    hero animations) — authors want to ship one `.lottie` with all
-    the interaction states baked in rather than wire state handling
-    in application code.
-  - **How:** Archive member `state_machine.json` alongside
-    `animation.json`. Decode into a struct paralleling Blinc's
-    existing [`blinc_core::FsmRuntime`](../../crates/blinc_core/src/fsm.rs)
-    so transition + guard logic reuses the framework FSM primitive
-    instead of reinventing:
-    - Named states → `StateId`s. Each carries a `segment: Range<f32>`
-      on the master timeline + a loop flag + playback speed.
-    - Events (`pointer.enter`, `pointer.click`, `custom("foo")`) →
-      `TransitionTrigger`s. Numeric inputs (`progress >= 0.5`) go
-      through guard closures.
-    - `LottieStateMachine` wraps `LottiePlayer` with a current-state
-      pointer + event queue. `.handle(event)` fires the FSM and
-      updates the player's playback range.
-  - **Scope notes:**
-    - Lands AFTER `.lottie` archive parsing — there's no JSON-only
-      state-machine format worth implementing in core Lottie.
-    - Reference: <https://dotlottie.io/state-machines>.
-    - Segment playback (in/out range on the player) is already
-      parsed via layer `ip`/`op`; the missing piece is a "play a
-      sub-range of the composition, not just per-layer" API on
-      `LottiePlayer` that the state machine drives.
+- [x] **dotLottie state machines** — shipped.
+  `LottieStateMachine::from_dotlottie_bytes` decodes
+  `state_machine.json` into a [`blinc_core::fsm::StateMachine`] so
+  transitions reuse the framework FSM primitive. States carry a
+  `segment: (start, end)` in seconds; `LottiePlayer::play_segment`
+  constrains the sketch-clock wrap to that window, seeks on every
+  transition so the new pose enters at its authored first frame.
+  Follow-ups still on the table:
+  - Per-state `loop: bool` (all segments loop today).
+  - Per-state playback speed multiplier.
+  - Guard closures + triggered actions (Blinc's FSM supports them
+    natively — just wire through from the schema when assets start
+    using them).
+  - Animated-segment markers (`"marker": "<name>"` pointing at a
+    Lottie marker instead of explicit `(start, end)`).
+  - Image-asset extraction from the archive for raster layers.
+  - Reference: <https://dotlottie.io/state-machines>.
 
 - [ ] **Keyframe lookup acceleration**
   - **Why:** `sample_*` does a linear scan per property per frame. Fine

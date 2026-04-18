@@ -24,9 +24,13 @@ use blinc_core::draw::Transform;
 use blinc_core::layer::Rect;
 use blinc_core::DrawContext;
 
+#[cfg(feature = "dotlottie")]
+mod dotlottie;
 mod layer;
 mod parser;
 mod shape;
+#[cfg(feature = "dotlottie")]
+pub mod state_machine;
 
 use layer::Layer;
 
@@ -38,6 +42,12 @@ type MarkerCallback = Box<dyn FnMut(&Marker) + Send + 'static>;
 pub enum Error {
     #[error("lottie json parse failed: {0}")]
     Json(#[from] serde_json::Error),
+    /// Archive read error (malformed .lottie zip or missing
+    /// required member). Only constructible when the `dotlottie`
+    /// feature is enabled.
+    #[cfg(feature = "dotlottie")]
+    #[error("dotlottie archive: {0}")]
+    Archive(String),
 }
 
 /// A named point (or span) on a Lottie scene's timeline.
@@ -76,6 +86,15 @@ pub struct LottiePlayer {
     /// Optional listener invoked once per marker boundary crossed
     /// between consecutive `draw_at` calls.
     marker_callback: Option<MarkerCallback>,
+    /// Optional playback segment `(start, end)` in seconds.
+    ///
+    /// When set, [`Self::scene_time`] wraps the sketch clock into
+    /// `[start, end)` instead of the composition's full duration.
+    /// State-machine transitions flip this field to scope playback
+    /// to the state's segment; raw callers can use [`Self::play_segment`]
+    /// / [`Self::clear_segment`] directly for one-shot trim behaviour
+    /// without pulling in the state-machine wrapper.
+    segment: Option<(f32, f32)>,
 }
 
 impl LottiePlayer {
@@ -89,6 +108,25 @@ impl LottiePlayer {
     pub fn from_bytes(src: &[u8]) -> Result<Self, Error> {
         let root: parser::LottieRoot = serde_json::from_slice(src)?;
         Ok(Self::from_root(root))
+    }
+
+    /// Parse a `.lottie` (dotLottie) archive into a player.
+    ///
+    /// A dotLottie archive is a zip with at least `animation.json`
+    /// (or a single `.json` entry) at its root plus optional image
+    /// assets and `state_machine.json`. This loader extracts only
+    /// the main animation JSON; callers wanting the state machine
+    /// should use [`crate::state_machine::LottieStateMachine::from_dotlottie_bytes`]
+    /// instead (which also returns the underlying player).
+    ///
+    /// Image-asset unpacking is still TODO — `.lottie` files that
+    /// reference external images via `assets[].p` will render the
+    /// vector content correctly but skip raster layers. Image
+    /// support lands alongside Phase 4's image-layer work.
+    #[cfg(feature = "dotlottie")]
+    pub fn from_dotlottie_bytes(src: &[u8]) -> Result<Self, Error> {
+        let (animation_json, _) = crate::dotlottie::extract_archive(src)?;
+        Self::from_bytes(&animation_json)
     }
 
     fn from_root(root: parser::LottieRoot) -> Self {
@@ -116,6 +154,7 @@ impl LottiePlayer {
             paused_at: None,
             last_scene_t: 0.0,
             marker_callback: None,
+            segment: None,
         }
     }
 
@@ -163,18 +202,57 @@ impl LottiePlayer {
 
     /// Resolve the effective scene time for a given sketch time `t`:
     /// if paused, returns the frozen pose time; otherwise returns
-    /// `t - seek_offset` wrapped into `[0, duration)`.
+    /// `t - seek_offset` wrapped into `[0, duration)`, or into
+    /// `[segment.0, segment.1)` when a segment is active.
     fn scene_time(&self, sketch_t: f32) -> f32 {
         if let Some(frozen) = self.paused_at {
             return frozen;
         }
-        let dur = self.duration().unwrap_or(f32::INFINITY);
         let raw = sketch_t - self.seek_offset;
+        // Segment mode: wrap into `[start, end)` around the segment's
+        // own length. `raw - start` lands in `[0, length)`, then `+
+        // start` shifts back into the absolute timeline. Callers who
+        // want segment-plays-once (no loop) should issue a `seek +
+        // set_playing(false)` at the segment's end via the marker
+        // hook or the state-machine wrapper below.
+        if let Some((start, end)) = self.segment {
+            let length = (end - start).max(f32::EPSILON);
+            return start + (raw - start).rem_euclid(length);
+        }
+        let dur = self.duration().unwrap_or(f32::INFINITY);
         if dur.is_finite() && dur > 0.0 {
             raw.rem_euclid(dur)
         } else {
             raw.max(0.0)
         }
+    }
+
+    /// Constrain playback to the `[start, end)` segment in seconds.
+    /// The sketch clock wraps within the segment's length instead
+    /// of the full composition duration, so a 10-second Lottie
+    /// with `play_segment(2.0, 5.0)` loops the same 3-second arc
+    /// every 3 seconds.
+    ///
+    /// `start` is clamped to `[0, duration]` and `end` to
+    /// `[start, duration]` so malformed segment data from a
+    /// state-machine JSON can't produce a negative-length range
+    /// that `rem_euclid` would panic on.
+    pub fn play_segment(&mut self, start: f32, end: f32) {
+        let dur = self.duration().unwrap_or(f32::INFINITY);
+        let s = start.clamp(0.0, dur.min(f32::MAX));
+        let e = end.clamp(s, dur.min(f32::MAX));
+        self.segment = Some((s, e));
+    }
+
+    /// Lift the segment constraint; subsequent `draw_at` calls wrap
+    /// on the full composition duration again.
+    pub fn clear_segment(&mut self) {
+        self.segment = None;
+    }
+
+    /// Current playback segment, if any.
+    pub fn segment(&self) -> Option<(f32, f32)> {
+        self.segment
     }
 
     /// Fire the marker callback for every marker whose timestamp falls in

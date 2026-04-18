@@ -35,6 +35,15 @@ serde_json = "1.0"
 # Error plumbing.
 thiserror = "2.0"
 
+# dotLottie archive support. `.lottie` is a zip containing
+# `animation.json` + `state_machine.json` + image assets. Feature-
+# gated so callers who only ever load raw JSON Lotties don't pay
+# for the `zip` crate's transitive deps (deflate, crc32fast, etc.).
+# `deflate` is the only algorithm .lottie archives use; turning
+# off the rest (bzip2, deflate64, lzma, zstd) shrinks the dep
+# tree substantially.
+zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
+
 # Local-dev patch — matches Blinc's workspace root, so
 # `cargo check` from inside this crate uses the colocated Blinc
 # checkout at `../../` instead of fetching the pinned rev. Also
@@ -53,3 +62,12 @@ blinc_platform = { path = "../../crates/blinc_platform" }
 
 [patch."https://github.com/project-blinc/blinc_input.git"]
 blinc_input = { path = "../blinc_input" }
+
+[features]
+# `.lottie` archive parsing + state-machine wrapper. Default on
+# because the archive format is what the dotLottie community has
+# standardised around for distribution, and most real-world Lottie
+# assets ship as `.lottie` now. Callers bundling only raw JSON
+# scenes can opt out via `default-features = false`.
+default = ["dotlottie"]
+dotlottie = ["dep:zip"]
