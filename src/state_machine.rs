@@ -23,9 +23,23 @@
 //! | `Transition` (immediate)| parsed + applied |
 //! | `Tweened` transitions   | parsed as immediate Transition (duration + easing ignored) |
 //! | `Event` guards          | applied — `send(input_name)` matches `inputName` |
-//! | Numeric / String / Boolean guards | parsed, always treated as truthy |
-//! | `actions` on transitions| parsed as opaque, not executed |
-//! | `interactions`, `inputs`| parsed, not yet wired |
+//! | `Numeric` / `String` / `Boolean` guards | applied — evaluated against the input store |
+//! | `SetNumeric` / `SetString` / `SetBoolean` / `Toggle` / `Increment` / `Decrement` actions | applied |
+//! | `Fire` / `Reset` actions | parsed, not executed (no event cascade / store reset yet) |
+//! | `interactions`, top-level `inputs` seeding | parsed, not yet wired |
+//!
+//! # Inputs
+//!
+//! The state machine owns an input store (numeric / string / boolean
+//! maps) that guard closures read and action closures write. Host
+//! code seeds inputs via [`LottieStateMachine::set_numeric`] etc. —
+//! any guard that reads an unseeded input gets `0.0` / `""` / `false`.
+//!
+//! Transitions with non-Event guards (e.g. a pure `Numeric` check)
+//! are still only fireable via [`Self::send`] — setting an input
+//! does not re-evaluate transitions. The typical authored pattern
+//! is `[Event + Numeric]` conjunction ("on click, if counter > 5"),
+//! which works naturally.
 //!
 //! Everything unsupported parses as a no-op rather than erroring,
 //! so assets that use richer features render with a best-effort
@@ -35,8 +49,11 @@
 #![cfg(feature = "dotlottie")]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use blinc_canvas_kit::{Player, SketchContext};
 use blinc_core::fsm::{EventId, StateId, StateMachine, Transition};
+use blinc_core::layer::Rect;
 use serde::Deserialize;
 
 use crate::{Error, LottiePlayer};
@@ -115,6 +132,8 @@ enum TransitionSpec {
         to_state: String,
         #[serde(default)]
         guards: Vec<GuardSpec>,
+        #[serde(default)]
+        actions: Vec<ActionSpec>,
     },
     /// Spec says Tweened animates between states over `duration`
     /// seconds using `easing` (cubic bezier control points). We
@@ -131,27 +150,142 @@ enum TransitionSpec {
         easing: Option<[f32; 4]>,
         #[serde(default)]
         guards: Vec<GuardSpec>,
+        #[serde(default)]
+        actions: Vec<ActionSpec>,
     },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum GuardSpec {
-    /// Event guards fire when the named input is sent via
-    /// [`LottieStateMachine::send`]. This is the one guard type
-    /// we actually evaluate — every other guard currently passes
-    /// through as `true`.
+    /// Fires when `inputName` is sent via [`LottieStateMachine::send`].
     Event {
         #[serde(rename = "inputName")]
         input_name: String,
     },
-    /// Remaining guard kinds parse into a permissive bucket so
-    /// decoding doesn't fail on assets that use them. The lack
-    /// of an input store means we can't evaluate them; treating
-    /// them as always-pass matches the "simplified subset"
-    /// framing documented at the top of the module.
+    /// Comparison against a numeric input. When paired with an
+    /// Event guard on the same transition, both must pass — the
+    /// conjunction is evaluated by the FSM's guard closure.
+    Numeric {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        #[serde(rename = "conditionType")]
+        condition_type: NumericOp,
+        #[serde(rename = "compareTo")]
+        compare_to: f64,
+    },
+    /// Comparison against a string input.
+    String {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        #[serde(rename = "conditionType")]
+        condition_type: StringOp,
+        #[serde(rename = "compareTo")]
+        compare_to: String,
+    },
+    /// Comparison against a boolean input.
+    Boolean {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        #[serde(rename = "conditionType")]
+        condition_type: BooleanOp,
+        #[serde(rename = "compareTo")]
+        compare_to: bool,
+    },
+    /// Parse catch-all so future guard kinds don't break decoding
+    /// of existing archives. An unsupported guard on a transition
+    /// always passes, matching the "lenient parse" contract documented
+    /// at the top of the module.
     #[serde(other)]
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum NumericOp {
+    Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterOrEqual,
+    LessThan,
+    LessOrEqual,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum StringOp {
+    Equal,
+    NotEqual,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum BooleanOp {
+    Equal,
+    NotEqual,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ActionSpec {
+    /// Overwrite a numeric input with a fixed value.
+    SetNumeric {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        value: f64,
+    },
+    /// Overwrite a string input.
+    SetString {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        value: String,
+    },
+    /// Overwrite a boolean input.
+    SetBoolean {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        value: bool,
+    },
+    /// Flip a boolean input (missing inputs default to `false`,
+    /// so `Toggle` on an unset key produces `true`).
+    Toggle {
+        #[serde(rename = "inputName")]
+        input_name: String,
+    },
+    /// Add to a numeric input (defaults to `0.0` + value if unset).
+    Increment {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        #[serde(default = "default_one")]
+        value: f64,
+    },
+    /// Subtract from a numeric input.
+    Decrement {
+        #[serde(rename = "inputName")]
+        input_name: String,
+        #[serde(default = "default_one")]
+        value: f64,
+    },
+    /// Dispatch another event. Parsed but not executed — the FSM
+    /// executes actions during `send()`, so a cascading `send()`
+    /// from within would need a deferred queue (tracked in BACKLOG).
+    Fire {
+        #[serde(rename = "inputName")]
+        #[allow(dead_code)]
+        input_name: String,
+    },
+    /// Reset an input's value. Parsed but not executed — the
+    /// state-machine JSON doesn't carry initial values in the
+    /// shape this loader consumes, so "reset to what?" is
+    /// ambiguous. Tracked in BACKLOG.
+    Reset {
+        #[serde(rename = "inputName")]
+        #[allow(dead_code)]
+        input_name: String,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
+fn default_one() -> f64 {
+    1.0
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +313,66 @@ pub struct LottieStateMachine {
     /// from the JSON are converted at load using the player's
     /// [`LottiePlayer::frame_rate`].
     state_segments: HashMap<StateId, (f32, f32)>,
+    /// Numeric / string / boolean input store. Shared with guard
+    /// and action closures inside the FSM via `Arc<Mutex<_>>`
+    /// because Blinc's `Transition::with_guard` / `with_action`
+    /// hold `Fn() -> bool` / `FnMut()` — nullary closures that can
+    /// only reach state through captured references.
+    inputs: Arc<Mutex<InputStore>>,
+    /// `(event_id, source_state_id) → Tweened metadata` for every
+    /// FSM edge derived from a `Tweened` transition. `send()`
+    /// consults this after an edge fires and, if present, arms
+    /// `pending_tween` with the crossfade parameters so the next
+    /// `draw_at` starts the fade.
+    tween_edges: HashMap<(EventId, StateId), TweenParams>,
+    /// Active visual crossfade between two segments, if any.
+    /// `None` whenever the player renders a single state normally.
+    tween: Option<Tween>,
+}
+
+/// Frozen parameters for a `Tweened` transition — precomputed at
+/// load so that `send()` can arm the tween without allocating.
+/// Cloned into `Tween` when the transition fires.
+#[derive(Debug, Clone)]
+struct TweenParams {
+    duration: f32,
+    easing: Option<[f32; 4]>,
+    /// Destination state (resolved at load). Mirrors the FSM's
+    /// `to_state` so we don't have to re-derive it after the edge
+    /// fires — `send()` could otherwise look up the FSM's history,
+    /// but that's fragile.
+    to_state: StateId,
+}
+
+/// In-flight crossfade between two state segments.
+#[derive(Debug, Clone)]
+struct Tween {
+    /// Source state's segment in seconds — used to apply the
+    /// right segment window when rendering the frozen source pose.
+    /// `None` when the source state had no `segment` (renders the
+    /// full composition at the frozen scene time).
+    #[allow(dead_code)]
+    from_segment: Option<(f32, f32)>,
+    /// Scene time to render the source pose at. The source pose
+    /// is frozen at this time for the tween's duration — it does
+    /// not continue animating during the crossfade.
+    from_scene_t: f32,
+    duration: f32,
+    easing: Option<[f32; 4]>,
+    /// Sketch time at which the tween started. `None` on the
+    /// frame the tween arms — set to `t` on the next `draw_at`
+    /// so sketches that `send()` long before their first frame
+    /// don't compute negative or huge progress values.
+    started_at_t: Option<f32>,
+}
+
+/// Backing store for dotLottie inputs. Guards read from it during
+/// FSM evaluation; actions mutate it on successful transitions.
+#[derive(Debug, Default)]
+struct InputStore {
+    numeric: HashMap<String, f64>,
+    string: HashMap<String, String>,
+    boolean: HashMap<String, bool>,
 }
 
 impl LottieStateMachine {
@@ -260,9 +454,14 @@ impl LottieStateMachine {
         // `blinc_core::Transition` per (source, event, target)
         // tuple. GlobalState transitions expand over every other
         // state so the spec's "fires from any state" semantics
-        // hold.
+        // hold. Non-Event guards on a transition are compiled
+        // into a conjunctive guard closure shared across all FSM
+        // edges generated from that transition. Actions likewise
+        // compile into an action closure attached to every edge.
         let mut event_names: HashMap<String, EventId> = HashMap::new();
         let mut transitions: Vec<Transition> = Vec::new();
+        let mut tween_edges: HashMap<(EventId, StateId), TweenParams> = HashMap::new();
+        let inputs: Arc<Mutex<InputStore>> = Arc::new(Mutex::new(InputStore::default()));
 
         for (i, entry) in spec.states.iter().enumerate() {
             let from_id = i as StateId;
@@ -283,30 +482,87 @@ impl LottieStateMachine {
             };
 
             for t in spec_transitions {
-                let (to_name, guards) = match t {
-                    TransitionSpec::Transition { to_state, guards }
-                    | TransitionSpec::Tweened {
-                        to_state, guards, ..
-                    } => (to_state, guards),
+                let (to_name, guards, actions, tween_params) = match t {
+                    TransitionSpec::Transition {
+                        to_state,
+                        guards,
+                        actions,
+                    } => (to_state, guards, actions, None),
+                    TransitionSpec::Tweened {
+                        to_state,
+                        guards,
+                        actions,
+                        duration,
+                        easing,
+                    } => (
+                        to_state,
+                        guards,
+                        actions,
+                        Some((*duration, *easing)),
+                    ),
                 };
                 let to_id = *state_ids.get(to_name).ok_or_else(|| {
                     Error::Archive(format!(
                         "transition references unknown target state '{to_name}'",
                     ))
                 })?;
-                // For each Event guard in the transition, wire
-                // one FSM edge per source state. Transitions with
-                // no Event guard can't be fired from `send()`
-                // (no event name to key on) — they're skipped
-                // until we add inputs + interactions.
-                for guard in guards {
-                    if let GuardSpec::Event { input_name } = guard {
-                        let next_event_id = event_names.len() as EventId;
-                        let event_id =
-                            *event_names.entry(input_name.clone()).or_insert(next_event_id);
-                        for &src in &source_ids {
-                            transitions.push(Transition::new(src, event_id, to_id));
+
+                // Split guards into event names + a conjunctive
+                // condition list. Without at least one Event guard
+                // the transition is unreachable via `send()`; skip
+                // wiring (but parse + validate the target so
+                // malformed JSON still surfaces early).
+                let (event_input_names, conditions) = split_guards(guards);
+                if event_input_names.is_empty() {
+                    continue;
+                }
+
+                for event_input in &event_input_names {
+                    let next_event_id = event_names.len() as EventId;
+                    let event_id = *event_names
+                        .entry(event_input.clone())
+                        .or_insert(next_event_id);
+
+                    for &src in &source_ids {
+                        if let Some((duration, easing)) = tween_params {
+                            // Record one entry per (event, source) so
+                            // `send()` can arm the tween after the
+                            // FSM edge fires. Duration/easing are
+                            // shared across every expanded edge.
+                            tween_edges.insert(
+                                (event_id, src),
+                                TweenParams {
+                                    duration,
+                                    easing,
+                                    to_state: to_id,
+                                },
+                            );
                         }
+                        let mut tr = Transition::new(src, event_id, to_id);
+
+                        if !conditions.is_empty() {
+                            let conds = conditions.clone();
+                            let store = Arc::clone(&inputs);
+                            tr = tr.with_guard(move || {
+                                let s = store.lock().expect("inputs poisoned");
+                                conds.iter().all(|c| c.eval(&s))
+                            });
+                        }
+
+                        let action_ops: Vec<ActionOp> =
+                            actions.iter().filter_map(ActionOp::from_spec).collect();
+                        if !action_ops.is_empty() {
+                            let ops = action_ops;
+                            let store = Arc::clone(&inputs);
+                            tr = tr.with_action(move || {
+                                let mut s = store.lock().expect("inputs poisoned");
+                                for op in &ops {
+                                    op.apply(&mut s);
+                                }
+                            });
+                        }
+
+                        transitions.push(tr);
                     }
                 }
             }
@@ -321,6 +577,9 @@ impl LottieStateMachine {
             state_names,
             event_names,
             state_segments,
+            inputs,
+            tween_edges,
+            tween: None,
         })
     }
 
@@ -331,7 +590,54 @@ impl LottieStateMachine {
             state_names: Vec::new(),
             event_names: HashMap::new(),
             state_segments: HashMap::new(),
+            inputs: Arc::new(Mutex::new(InputStore::default())),
+            tween_edges: HashMap::new(),
+            tween: None,
         }
+    }
+
+    /// Set a numeric input used by `Numeric` guards and `Set*` /
+    /// `Increment` / `Decrement` / `Toggle` actions. Guards read
+    /// the store on every `send()`, so this method does not fire
+    /// transitions on its own — host code sets the input first,
+    /// then sends an event.
+    pub fn set_numeric(&mut self, name: &str, value: f64) {
+        let mut s = self.inputs.lock().expect("inputs poisoned");
+        s.numeric.insert(name.to_string(), value);
+    }
+
+    /// Set a string input. See [`Self::set_numeric`] for
+    /// evaluation semantics.
+    pub fn set_string(&mut self, name: &str, value: &str) {
+        let mut s = self.inputs.lock().expect("inputs poisoned");
+        s.string.insert(name.to_string(), value.to_string());
+    }
+
+    /// Set a boolean input. See [`Self::set_numeric`] for
+    /// evaluation semantics.
+    pub fn set_boolean(&mut self, name: &str, value: bool) {
+        let mut s = self.inputs.lock().expect("inputs poisoned");
+        s.boolean.insert(name.to_string(), value);
+    }
+
+    /// Current value of a numeric input, or `None` if it hasn't
+    /// been seeded. Useful for host code that mirrors input state
+    /// back into its own UI / model.
+    pub fn get_numeric(&self, name: &str) -> Option<f64> {
+        let s = self.inputs.lock().expect("inputs poisoned");
+        s.numeric.get(name).copied()
+    }
+
+    /// Current value of a string input, or `None` if unseeded.
+    pub fn get_string(&self, name: &str) -> Option<String> {
+        let s = self.inputs.lock().expect("inputs poisoned");
+        s.string.get(name).cloned()
+    }
+
+    /// Current value of a boolean input, or `None` if unseeded.
+    pub fn get_boolean(&self, name: &str) -> Option<bool> {
+        let s = self.inputs.lock().expect("inputs poisoned");
+        s.boolean.get(name).copied()
     }
 
     /// Borrow the inner player (for `Player` trait calls: `draw_at`,
@@ -361,18 +667,175 @@ impl LottieStateMachine {
     /// transition changed state. Returns `true` on state change,
     /// `false` when the event is unknown or no matching transition
     /// applies from the current state.
+    ///
+    /// If the fired edge was authored as `Tweened`, this also arms
+    /// a visual crossfade between the source and destination
+    /// segments. The fade starts on the next [`Player::draw_at`]
+    /// call (to capture an accurate starting `t`) and runs for the
+    /// authored `duration` seconds, easing along the authored cubic
+    /// bezier if present.
     pub fn send(&mut self, event_name: &str) -> bool {
         let Some(&event_id) = self.event_names.get(event_name) else {
             return false;
         };
         let prev = self.fsm.current_state();
+        // Snapshot the source pose *before* the transition fires —
+        // after `fsm.send` + `apply_state_segment`, the player's
+        // clock has been rebound to the destination segment, so
+        // `last_scene_t()` would read a fresh value.
+        let from_scene_t = self.player.last_scene_t();
+        let from_segment = self.player.segment();
         let next = self.fsm.send(event_id);
         if next == prev {
             return false;
         }
         apply_state_segment(&mut self.player, next, &self.state_segments);
+        if let Some(params) = self.tween_edges.get(&(event_id, prev)) {
+            // Guard: only arm the tween if the FSM actually landed
+            // on the target we recorded. A Tweened transition with
+            // a failing non-Event guard takes a different edge
+            // (if any) — the crossfade would be wrong.
+            if params.to_state == next && params.duration > 0.0 {
+                self.tween = Some(Tween {
+                    from_segment,
+                    from_scene_t,
+                    duration: params.duration,
+                    easing: params.easing,
+                    started_at_t: None,
+                });
+            }
+        }
         true
     }
+
+    /// Whether a Tweened transition's crossfade is currently
+    /// running. Exposes the fade state for host code that needs
+    /// to gate input (e.g. ignoring clicks mid-transition).
+    pub fn is_tweening(&self) -> bool {
+        self.tween.is_some()
+    }
+}
+
+impl Player for LottieStateMachine {
+    fn duration(&self) -> Option<f32> {
+        self.player.duration()
+    }
+
+    fn seek(&mut self, t: f32) {
+        self.player.seek(t);
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        self.player.set_playing(playing);
+    }
+
+    /// Render the state machine's current pose. When a Tweened
+    /// transition is active, blends the frozen source pose with
+    /// the destination animation by crossfading opacity over the
+    /// authored `duration`.
+    fn draw_at(&mut self, ctx: &mut SketchContext<'_>, rect: Rect, t: f32) {
+        // No tween in flight → straight delegation. Keeps the
+        // non-tween render path exactly as fast as the bare player.
+        let Some(tween) = self.tween.as_mut() else {
+            self.player.draw_at(ctx, rect, t);
+            return;
+        };
+
+        // Arm `started_at_t` on first frame of the tween. Using
+        // the incoming `t` instead of the moment `send()` ran
+        // means host code that calls `send()` far ahead of the
+        // first draw still sees a correctly-scaled crossfade.
+        let started = *tween.started_at_t.get_or_insert(t);
+        let raw = if tween.duration > 0.0 {
+            ((t - started) / tween.duration).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        if raw >= 1.0 {
+            // Tween finished — clear and render the destination
+            // normally. The destination animation's clock is
+            // already bound to its segment (set in `send()`).
+            self.tween = None;
+            self.player.draw_at(ctx, rect, t);
+            return;
+        }
+
+        let progress = apply_cubic_bezier_easing(raw, tween.easing);
+        let from_scene_t = tween.from_scene_t;
+
+        // Render source pose at (1 - progress). `draw_frame`
+        // bypasses the player's clock so the destination segment
+        // set in `send()` isn't disturbed.
+        {
+            let dc = ctx.draw_context();
+            dc.push_opacity(1.0 - progress);
+        }
+        self.player.draw_frame(ctx, rect, from_scene_t);
+        {
+            let dc = ctx.draw_context();
+            dc.pop_opacity();
+        }
+
+        // Render destination at `progress`. `draw_at` advances
+        // the destination timeline by the elapsed sketch time
+        // since the tween armed.
+        {
+            let dc = ctx.draw_context();
+            dc.push_opacity(progress);
+        }
+        self.player.draw_at(ctx, rect, t);
+        {
+            let dc = ctx.draw_context();
+            dc.pop_opacity();
+        }
+    }
+}
+
+/// Apply a cubic bezier easing curve parameterised by `[p1x, p1y,
+/// p2x, p2y]`. The curve's start (0, 0) and end (1, 1) are fixed;
+/// `p1` / `p2` are the two middle control points.
+///
+/// Implementation: solve `bezier_x(t_param) = u` via a bounded
+/// Newton's method (four iterations tends to converge for the
+/// control-point ranges Lottie / CSS authoring produces), then
+/// evaluate `bezier_y(t_param)`. Falls back to linear when `easing`
+/// is `None` or any control-point component is NaN.
+fn apply_cubic_bezier_easing(u: f32, easing: Option<[f32; 4]>) -> f32 {
+    let Some([p1x, p1y, p2x, p2y]) = easing else {
+        return u;
+    };
+    if !(p1x.is_finite() && p1y.is_finite() && p2x.is_finite() && p2y.is_finite()) {
+        return u;
+    }
+    // Cubic bezier polynomial coefficients: B(t) = a*t^3 + b*t^2 + c*t,
+    // where a = 1 - 3*p2 + 3*p1, b = 3*p2 - 6*p1, c = 3*p1.
+    // Derivative: B'(t) = 3*a*t^2 + 2*b*t + c.
+    let cx = 3.0 * p1x;
+    let bx = 3.0 * p2x - 6.0 * p1x;
+    let ax = 1.0 - 3.0 * p2x + 3.0 * p1x;
+    let cy = 3.0 * p1y;
+    let by = 3.0 * p2y - 6.0 * p1y;
+    let ay = 1.0 - 3.0 * p2y + 3.0 * p1y;
+
+    let bezier_x = |t: f32| ((ax * t + bx) * t + cx) * t;
+    let bezier_dx = |t: f32| (3.0 * ax * t + 2.0 * bx) * t + cx;
+    let bezier_y = |t: f32| ((ay * t + by) * t + cy) * t;
+
+    // Newton iterations. Start at `u` (good initial guess — the
+    // identity curve is the fallback when the bezier is close to
+    // linear) and refine toward `bezier_x(t) = u`.
+    let mut t = u;
+    for _ in 0..6 {
+        let dx = bezier_dx(t);
+        if dx.abs() < 1e-6 {
+            break;
+        }
+        let err = bezier_x(t) - u;
+        t -= err / dx;
+        t = t.clamp(0.0, 1.0);
+    }
+    bezier_y(t)
 }
 
 /// Helper: borrow the `transitions` array out of a state entry
@@ -383,6 +846,175 @@ fn entry_transitions(entry: &StateEntry) -> &[TransitionSpec] {
     match entry {
         StateEntry::PlaybackState(p) => &p.transitions,
         StateEntry::GlobalState(g) => &g.transitions,
+    }
+}
+
+/// Split a transition's raw `guards` array into the set of event
+/// input names (which key the FSM dispatch) and a compiled list
+/// of conjunctive conditions the guard closure evaluates at send
+/// time. `Unsupported` guards are dropped with the lenient-parse
+/// contract documented at the top of the module.
+fn split_guards(guards: &[GuardSpec]) -> (Vec<String>, Vec<Condition>) {
+    let mut events: Vec<String> = Vec::new();
+    let mut conditions: Vec<Condition> = Vec::new();
+    for g in guards {
+        match g {
+            GuardSpec::Event { input_name } => events.push(input_name.clone()),
+            GuardSpec::Numeric {
+                input_name,
+                condition_type,
+                compare_to,
+            } => conditions.push(Condition::Numeric {
+                name: input_name.clone(),
+                op: *condition_type,
+                value: *compare_to,
+            }),
+            GuardSpec::String {
+                input_name,
+                condition_type,
+                compare_to,
+            } => conditions.push(Condition::String {
+                name: input_name.clone(),
+                op: *condition_type,
+                value: compare_to.clone(),
+            }),
+            GuardSpec::Boolean {
+                input_name,
+                condition_type,
+                compare_to,
+            } => conditions.push(Condition::Boolean {
+                name: input_name.clone(),
+                op: *condition_type,
+                value: *compare_to,
+            }),
+            GuardSpec::Unsupported => {}
+        }
+    }
+    (events, conditions)
+}
+
+/// Compiled guard condition. `Clone` because one `TransitionSpec`
+/// feeds N FSM edges (event × source state), and each edge gets
+/// its own captured copy inside the guard closure.
+#[derive(Debug, Clone)]
+enum Condition {
+    Numeric {
+        name: String,
+        op: NumericOp,
+        value: f64,
+    },
+    String {
+        name: String,
+        op: StringOp,
+        value: String,
+    },
+    Boolean {
+        name: String,
+        op: BooleanOp,
+        value: bool,
+    },
+}
+
+impl Condition {
+    fn eval(&self, store: &InputStore) -> bool {
+        match self {
+            Condition::Numeric { name, op, value } => {
+                let v = store.numeric.get(name).copied().unwrap_or(0.0);
+                match op {
+                    NumericOp::Equal => (v - value).abs() < f64::EPSILON,
+                    NumericOp::NotEqual => (v - value).abs() >= f64::EPSILON,
+                    NumericOp::GreaterThan => v > *value,
+                    NumericOp::GreaterOrEqual => v >= *value,
+                    NumericOp::LessThan => v < *value,
+                    NumericOp::LessOrEqual => v <= *value,
+                }
+            }
+            Condition::String { name, op, value } => {
+                let default = String::new();
+                let v = store.string.get(name).unwrap_or(&default);
+                match op {
+                    StringOp::Equal => v == value,
+                    StringOp::NotEqual => v != value,
+                }
+            }
+            Condition::Boolean { name, op, value } => {
+                let v = store.boolean.get(name).copied().unwrap_or(false);
+                match op {
+                    BooleanOp::Equal => v == *value,
+                    BooleanOp::NotEqual => v != *value,
+                }
+            }
+        }
+    }
+}
+
+/// Compiled transition action. `Fire` and `Reset` parse but don't
+/// execute — see their `ActionSpec` docs for why — so they don't
+/// produce an `ActionOp`.
+#[derive(Debug, Clone)]
+enum ActionOp {
+    SetNumeric { name: String, value: f64 },
+    SetString { name: String, value: String },
+    SetBoolean { name: String, value: bool },
+    Toggle { name: String },
+    Increment { name: String, value: f64 },
+    Decrement { name: String, value: f64 },
+}
+
+impl ActionOp {
+    fn from_spec(spec: &ActionSpec) -> Option<Self> {
+        match spec {
+            ActionSpec::SetNumeric { input_name, value } => Some(Self::SetNumeric {
+                name: input_name.clone(),
+                value: *value,
+            }),
+            ActionSpec::SetString { input_name, value } => Some(Self::SetString {
+                name: input_name.clone(),
+                value: value.clone(),
+            }),
+            ActionSpec::SetBoolean { input_name, value } => Some(Self::SetBoolean {
+                name: input_name.clone(),
+                value: *value,
+            }),
+            ActionSpec::Toggle { input_name } => Some(Self::Toggle {
+                name: input_name.clone(),
+            }),
+            ActionSpec::Increment { input_name, value } => Some(Self::Increment {
+                name: input_name.clone(),
+                value: *value,
+            }),
+            ActionSpec::Decrement { input_name, value } => Some(Self::Decrement {
+                name: input_name.clone(),
+                value: *value,
+            }),
+            ActionSpec::Fire { .. } | ActionSpec::Reset { .. } | ActionSpec::Unsupported => None,
+        }
+    }
+
+    fn apply(&self, store: &mut InputStore) {
+        match self {
+            ActionOp::SetNumeric { name, value } => {
+                store.numeric.insert(name.clone(), *value);
+            }
+            ActionOp::SetString { name, value } => {
+                store.string.insert(name.clone(), value.clone());
+            }
+            ActionOp::SetBoolean { name, value } => {
+                store.boolean.insert(name.clone(), *value);
+            }
+            ActionOp::Toggle { name } => {
+                let entry = store.boolean.entry(name.clone()).or_insert(false);
+                *entry = !*entry;
+            }
+            ActionOp::Increment { name, value } => {
+                let entry = store.numeric.entry(name.clone()).or_insert(0.0);
+                *entry += *value;
+            }
+            ActionOp::Decrement { name, value } => {
+                let entry = store.numeric.entry(name.clone()).or_insert(0.0);
+                *entry -= *value;
+            }
+        }
     }
 }
 
@@ -579,10 +1211,10 @@ mod tests {
     }
 
     #[test]
-    fn tweened_transition_parses_and_fires_as_immediate() {
-        // Tweened downgrades to immediate for now — the duration
-        // + easing fields are preserved but don't drive animation
-        // interpolation yet.
+    fn tweened_transition_arms_crossfade_on_send() {
+        // Tweened transitions flip the FSM immediately and arm a
+        // visual crossfade — `is_tweening()` flips true on `send`,
+        // the player's segment is already on the destination.
         let spec = r#"{
             "initial": "a",
             "states": [
@@ -611,8 +1243,64 @@ mod tests {
         }"#;
         let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
         let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert!(!sm.is_tweening());
         assert!(sm.send("go"));
         assert_eq!(sm.current_state_name(), "b");
+        assert!(sm.is_tweening(), "tween should arm after Tweened transition");
+        assert_eq!(sm.player().segment(), Some((1.0, 2.0)), "segment already on dest");
+    }
+
+    #[test]
+    fn tweened_with_zero_duration_does_not_arm() {
+        // Zero-duration tween is meaningless — treat as immediate
+        // so the crossfade path isn't entered on degenerate input.
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState",
+                    "name": "a",
+                    "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Tweened",
+                            "toState": "b",
+                            "duration": 0.0,
+                            "guards": [{ "type": "Event", "inputName": "go" }]
+                        }
+                    ]
+                },
+                { "type": "PlaybackState", "name": "b", "animation": "main" }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert!(sm.send("go"));
+        assert!(!sm.is_tweening());
+    }
+
+    #[test]
+    fn cubic_bezier_easing_matches_endpoints_and_shape() {
+        // Linear fallback (no easing provided) is identity.
+        assert!((apply_cubic_bezier_easing(0.0, None) - 0.0).abs() < 1e-6);
+        assert!((apply_cubic_bezier_easing(1.0, None) - 1.0).abs() < 1e-6);
+        assert!((apply_cubic_bezier_easing(0.5, None) - 0.5).abs() < 1e-6);
+
+        // CSS `ease-in`: starts slow, ends fast. Midpoint < 0.5.
+        let ease_in = Some([0.42, 0.0, 1.0, 1.0]);
+        assert!((apply_cubic_bezier_easing(0.0, ease_in) - 0.0).abs() < 1e-4);
+        assert!((apply_cubic_bezier_easing(1.0, ease_in) - 1.0).abs() < 1e-4);
+        assert!(
+            apply_cubic_bezier_easing(0.5, ease_in) < 0.5,
+            "ease-in midpoint should be below linear"
+        );
+
+        // CSS `ease-out`: starts fast, ends slow. Midpoint > 0.5.
+        let ease_out = Some([0.0, 0.0, 0.58, 1.0]);
+        assert!(
+            apply_cubic_bezier_easing(0.5, ease_out) > 0.5,
+            "ease-out midpoint should be above linear"
+        );
     }
 
     #[test]
@@ -658,6 +1346,117 @@ mod tests {
             Err(Error::Archive(_)) => {}
             other => panic!("expected Archive error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn numeric_guard_blocks_transition_until_input_set() {
+        // `Event + Numeric` conjunction: `go` only fires when
+        // `counter > 5`. Without seeding, counter defaults to 0
+        // so the guard fails; after `set_numeric(6)` it passes.
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState",
+                    "name": "a",
+                    "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition",
+                            "toState": "b",
+                            "guards": [
+                                { "type": "Event", "inputName": "go" },
+                                { "type": "Numeric", "inputName": "counter",
+                                  "conditionType": "GreaterThan", "compareTo": 5.0 }
+                            ]
+                        }
+                    ]
+                },
+                { "type": "PlaybackState", "name": "b", "animation": "main" }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        assert!(!sm.send("go"), "guard should block without counter set");
+        assert_eq!(sm.current_state_name(), "a");
+        sm.set_numeric("counter", 6.0);
+        assert!(sm.send("go"));
+        assert_eq!(sm.current_state_name(), "b");
+    }
+
+    #[test]
+    fn string_and_boolean_guards_evaluate() {
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState",
+                    "name": "a",
+                    "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition",
+                            "toState": "b",
+                            "guards": [
+                                { "type": "Event", "inputName": "go" },
+                                { "type": "String", "inputName": "role",
+                                  "conditionType": "Equal", "compareTo": "admin" },
+                                { "type": "Boolean", "inputName": "ready",
+                                  "conditionType": "Equal", "compareTo": true }
+                            ]
+                        }
+                    ]
+                },
+                { "type": "PlaybackState", "name": "b", "animation": "main" }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        sm.set_string("role", "guest");
+        sm.set_boolean("ready", true);
+        assert!(!sm.send("go"), "role mismatch should block");
+        sm.set_string("role", "admin");
+        sm.set_boolean("ready", false);
+        assert!(!sm.send("go"), "ready=false should block");
+        sm.set_boolean("ready", true);
+        assert!(sm.send("go"));
+        assert_eq!(sm.current_state_name(), "b");
+    }
+
+    #[test]
+    fn set_and_increment_actions_mutate_input_store() {
+        // Actions fire on successful transition. `go` sets a
+        // numeric, flips a boolean, and increments a counter.
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState",
+                    "name": "a",
+                    "animation": "main",
+                    "transitions": [
+                        {
+                            "type": "Transition",
+                            "toState": "b",
+                            "guards": [{ "type": "Event", "inputName": "go" }],
+                            "actions": [
+                                { "type": "SetNumeric", "inputName": "value", "value": 42.0 },
+                                { "type": "Toggle", "inputName": "flag" },
+                                { "type": "Increment", "inputName": "count", "value": 3.0 }
+                            ]
+                        }
+                    ]
+                },
+                { "type": "PlaybackState", "name": "b", "animation": "main" }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        sm.set_numeric("count", 10.0);
+        assert!(sm.send("go"));
+        assert_eq!(sm.get_numeric("value"), Some(42.0));
+        assert_eq!(sm.get_boolean("flag"), Some(true));
+        assert_eq!(sm.get_numeric("count"), Some(13.0));
     }
 
     #[test]

@@ -157,33 +157,35 @@ it.
 
 - [x] **dotLottie state machines** — shipped, spec-2.0 subset.
   `LottieStateMachine::from_dotlottie_bytes` decodes `s/<id>.json`
-  (tagged `PlaybackState` / `GlobalState` entries, nested
-  `Transition` / `Tweened` arrays, `Event` / `Numeric` / `String` /
-  `Boolean` guards) into a [`blinc_core::fsm::StateMachine`] so
-  transitions reuse the framework FSM primitive. Frame-based
+  into a [`blinc_core::fsm::StateMachine`] so transitions reuse
+  the framework FSM primitive. Frame-based
   `segment: [start, end]` values are converted to seconds at load
-  using `LottiePlayer::frame_rate`; `play_segment` / `clear_segment`
-  on the player constrain the sketch-clock wrap. Scoped subset (see
+  using `LottiePlayer::frame_rate`. Scoped subset (see
   `state_machine.rs` module docs for the full matrix):
   - **Applied**: PlaybackState + GlobalState, `segment`, immediate
-    `Transition`, `Event` guards (fire on `send(input_name)`),
-    `GlobalState` transitions expanded over every other state so
-    they fire from any source state.
-  - **Parsed, no-op**: `Tweened` transitions fire immediately
-    (duration + easing ignored); non-`Event` guards always pass;
-    `actions`, `interactions`, `inputs`; per-state `loop`,
-    `loopCount`, `speed`, `autoplay`; `mode` other than Forward.
+    `Transition`, `Tweened` transitions (visual crossfade over
+    `duration` with cubic-bezier `easing` — source pose freezes,
+    destination plays forward, opacity ramp eased by authored
+    curve), `Event` / `Numeric` / `String` / `Boolean` guards
+    evaluated conjunctively against a shared input store,
+    `SetNumeric` / `SetString` / `SetBoolean` / `Toggle` /
+    `Increment` / `Decrement` actions mutate the store on
+    successful transitions, `GlobalState` transitions expanded
+    over every other state so they fire from any source.
+  - **Parsed, no-op**: `Fire` / `Reset` actions; `interactions`;
+    top-level `inputs` seeding; per-state `loop`, `loopCount`,
+    `speed`, `autoplay`; `mode` other than Forward.
 
   Follow-ups still on the table:
-  - Tween duration + easing (`Tweened` currently downgrades to
-    immediate — crossfades between segments are the primary
-    visual gap).
-  - Numeric / String / Boolean guards driven by an input store
-    exposed via `send_numeric` / `send_string` / `send_boolean`.
-  - `actions` execution (`fire` / `reset` / `toggle` / `setNumeric`
-    / `setString` / `setBoolean`).
+  - `Fire` action (cascading `send()` — needs a deferred event
+    queue so the FSM can finish the current edge before
+    dispatching the next).
+  - `Reset` action (needs an initial-values table captured at load
+    so "reset to what?" has a defined answer).
   - Per-state playback modifiers: `loop: false`, `loopCount`,
     `speed`, `Reverse` / `Bounce` / `ReverseBounce` modes.
+  - Top-level `inputs[]` seed values at load (current host code
+    seeds via `set_numeric` / `set_string` / `set_boolean`).
   - Animated-segment markers (`"marker": "<name>"` pointing at a
     Lottie marker instead of explicit `[start, end]` frames).
   - Image-asset extraction from the archive for raster layers.

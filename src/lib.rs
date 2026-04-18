@@ -269,6 +269,37 @@ impl LottiePlayer {
         self.segment
     }
 
+    /// Last scene time that `draw_at` resolved to. Used by the
+    /// state-machine wrapper to freeze the "source pose" at the
+    /// moment a Tweened transition fires — during the crossfade
+    /// the source layer renders at this time while the
+    /// destination plays forward from its segment start.
+    pub fn last_scene_t(&self) -> f32 {
+        self.last_scene_t
+    }
+
+    /// Render one frame at absolute scene time `scene_t`, bypassing
+    /// the player's clock / segment / pause / markers entirely. The
+    /// player's internal state is not mutated — `draw_frame` is safe
+    /// to call while `draw_at` is driving a separate frame on the
+    /// same player. Used by [`crate::state_machine::LottieStateMachine`]
+    /// to render the source pose during a Tweened crossfade.
+    pub fn draw_frame(&self, ctx: &mut SketchContext<'_>, rect: Rect, scene_t: f32) {
+        let src_w = self.root.width.max(1) as f32;
+        let src_h = self.root.height.max(1) as f32;
+        let sx = rect.width() / src_w;
+        let sy = rect.height() / src_h;
+
+        let dc: &mut dyn DrawContext = ctx.draw_context();
+        dc.push_transform(Transform::translate(rect.x(), rect.y()));
+        dc.push_transform(Transform::scale(sx, sy));
+        for layer in self.layers.iter().rev() {
+            layer.render(dc, scene_t);
+        }
+        dc.pop_transform();
+        dc.pop_transform();
+    }
+
     /// Fire the marker callback for every marker whose timestamp falls in
     /// `(prev, current]`, accounting for playback loop wrap.
     fn fire_markers(&mut self, prev: f32, current: f32) {
