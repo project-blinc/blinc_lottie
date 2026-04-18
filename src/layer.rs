@@ -5,12 +5,13 @@
 //! as an opaque `serde_json::Value`; [`Layer::from_value`] dispatches on
 //! the `ty` field and produces a typed `Layer`.
 //!
-//! Phase 1.1 implemented **solid layers** (`ty: 1`). Phase 1.2 adds
-//! **keyframe interpolation** for transform properties with linear easing
-//! between keyframes. Bezier easing (`i.x` / `o.x` tangent handles) is
-//! deferred — keyframes sampled through the linear path will look
-//! slightly different from the source tool until then, but timing
-//! offsets are already exact.
+//! Solid layers (`ty: 1`) and shape layers (`ty: 4`) render. Every
+//! animatable transform property (position, anchor, scale, rotation,
+//! opacity, plus per-component shape properties) supports keyframes
+//! with hold, linear, and cubic-bezier temporal easing. Bezier
+//! tangents are solved via [`solve_bezier_ease`] (Newton's method on
+//! `bezier_x(t) = u`); per-component tangents fold into a shared
+//! easing by taking the first array element.
 //!
 //! Other layer types parse as [`LayerKind::Unknown`] and render as
 //! no-ops.
@@ -40,6 +41,24 @@ pub(crate) struct Layer {
     /// would need either inverse-clip support from `DrawContext` or
     /// an offscreen render pass.
     pub masks: Vec<MaskSpec>,
+    /// Layer's own identifier (the Lottie `ind` field). Used as the
+    /// key another layer's `parent` points at. `None` when the
+    /// export omitted `ind` — rare but tolerated; such a layer
+    /// can't be targeted as a parent but still renders.
+    pub ind: Option<i32>,
+    /// Direct parent's `ind` (Lottie `parent`). `None` for
+    /// top-level layers. Resolution into the composition's layer
+    /// vec happens in [`resolve_parent_chains`]; consumers should
+    /// use [`Self::parent_chain`] instead of resolving this again
+    /// per frame.
+    pub parent_ind: Option<i32>,
+    /// Ancestor chain in render order — outermost ancestor first,
+    /// direct parent last. Indices refer to slots in the player's
+    /// layer vec. Populated once per load by
+    /// [`resolve_parent_chains`]; forward-referenced or cyclic
+    /// parents produce an empty chain so malformed exports
+    /// render the layer un-parented rather than looping forever.
+    pub parent_chain: Vec<usize>,
 }
 
 /// A single mask entry from a layer's `masksProperties` array.
@@ -480,12 +499,17 @@ impl Layer {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().map(|m| parse_mask(m, fr)).collect())
             .unwrap_or_default();
+        let ind = v.get("ind").and_then(Value::as_i64).map(|n| n as i32);
+        let parent_ind = v.get("parent").and_then(Value::as_i64).map(|n| n as i32);
         Self {
             kind,
             in_seconds: in_frames / fr,
             out_seconds: out_frames / fr,
             transform,
             masks,
+            ind,
+            parent_ind,
+            parent_chain: Vec::new(),
         }
     }
 
@@ -872,6 +896,73 @@ pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
     dc.pop_transform();
 }
 
+/// Push a parent's transform onto the stack without its opacity.
+/// Lottie / After Effects parent transforms compose spatially
+/// (position · rotation · scale · anchor) but do not propagate
+/// opacity — each layer gates its own fade independently. The
+/// caller matches each call with exactly one
+/// [`pop_parent_transform`].
+pub(crate) fn push_parent_transform(dc: &mut dyn DrawContext, xform: &SampledTransform) {
+    dc.push_transform(Transform::translate(xform.position[0], xform.position[1]));
+    dc.push_transform(Transform::rotate(xform.rotation));
+    dc.push_transform(Transform::scale(xform.scale[0], xform.scale[1]));
+    dc.push_transform(Transform::translate(-xform.anchor[0], -xform.anchor[1]));
+}
+
+pub(crate) fn pop_parent_transform(dc: &mut dyn DrawContext) {
+    dc.pop_transform();
+    dc.pop_transform();
+    dc.pop_transform();
+    dc.pop_transform();
+}
+
+/// Populate every layer's `parent_chain` from its `parent_ind`.
+/// Walks the chain one hop at a time, guarded against cycles and
+/// forward references to missing `ind` values; in either case the
+/// layer ends up with an empty chain so the composition still
+/// renders (the bad layer just ignores its missing parent).
+/// Output is outermost-ancestor-first so callers can push in order.
+pub(crate) fn resolve_parent_chains(layers: &mut [Layer]) {
+    use std::collections::HashMap;
+    let mut ind_to_index: HashMap<i32, usize> = HashMap::new();
+    for (i, layer) in layers.iter().enumerate() {
+        if let Some(ind) = layer.ind {
+            // Later layers with duplicate `ind` shadow earlier
+            // ones — matches the common exporter behaviour and
+            // keeps a single Option<usize> lookup per chain step.
+            ind_to_index.insert(ind, i);
+        }
+    }
+    for i in 0..layers.len() {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut current = layers[i].parent_ind;
+        // Cycle guard: a parent chain longer than the total layer
+        // count would've revisited a node, so bail once we hit that
+        // bound. Cheaper than a HashSet for the typical ~3-5 hops
+        // dotLottie scenes use.
+        let max_depth = layers.len();
+        while let Some(p_ind) = current {
+            if chain.len() >= max_depth {
+                chain.clear();
+                break;
+            }
+            let Some(&p_idx) = ind_to_index.get(&p_ind) else {
+                break;
+            };
+            if p_idx == i || chain.contains(&p_idx) {
+                // Direct self-parent or cycle back to a visited
+                // ancestor — drop the chain entirely.
+                chain.clear();
+                break;
+            }
+            chain.push(p_idx);
+            current = layers[p_idx].parent_ind;
+        }
+        chain.reverse();
+        layers[i].parent_chain = chain;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +1022,111 @@ mod tests {
         let v = json!({ "ty": 99, "ip": 0, "op": 60 });
         let layer = Layer::from_value(&v, 60.0);
         assert!(matches!(layer.kind, LayerKind::Unknown));
+    }
+
+    #[test]
+    fn bezier_easing_deflects_from_linear() {
+        // After Effects' "Easy Ease" preset emits tangents around
+        // (0.833, 0) on `o` and (0.167, 1) on `i` — the classic
+        // S-curve that slows near both endpoints.
+        let out = BezierTangent { x: 0.833, y: 0.0 };
+        let in_ = BezierTangent { x: 0.167, y: 1.0 };
+        // Midpoint of an ease-in-out curve crosses y ≈ 0.5 by
+        // symmetry; the quarter-point should fall well below 0.25
+        // (the curve is still flat near the start).
+        let midpoint = solve_bezier_ease(0.5, out, in_);
+        let quarter = solve_bezier_ease(0.25, out, in_);
+        assert!((midpoint - 0.5).abs() < 0.01, "midpoint ≈ 0.5, got {midpoint}");
+        assert!(quarter < 0.15, "quarter-point should be pulled flat, got {quarter}");
+        // Endpoints must stay fixed — a wandering endpoint would
+        // cause visible pose jumps at keyframe boundaries.
+        assert!((solve_bezier_ease(0.0, out, in_) - 0.0).abs() < 1e-5);
+        assert!((solve_bezier_ease(1.0, out, in_) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bezier_eased_sample_deviates_from_linear() {
+        // Easy Ease tangents spanning a 0→100 opacity segment. Per
+        // Lottie convention `o` lives on the earlier keyframe (the
+        // handle leaving it) and `i` on the later keyframe (the
+        // handle arriving at it). A symmetric S-curve midpoint
+        // crosses ~50%, but the quarter-point should be pulled
+        // clearly below the linear 25% value because the curve is
+        // still flat near the start.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 10.0, "sh": 10.0, "sc": "#000000",
+            "ks": {
+                "o": {
+                    "a": 1,
+                    "k": [
+                        { "t": 0,  "s": [0.0],   "o": { "x": 0.833, "y": 0.0 } },
+                        { "t": 60, "s": [100.0], "i": { "x": 0.167, "y": 1.0 } }
+                    ]
+                }
+            }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        let linear_quarter = 0.25f32;
+        let eased_quarter = layer.transform.sample(0.25).opacity;
+        assert!(
+            eased_quarter < linear_quarter - 0.05,
+            "eased quarter {eased_quarter} should trail linear {linear_quarter}"
+        );
+    }
+
+    #[test]
+    fn parent_chain_resolves_in_outermost_first_order() {
+        // Three-layer chain: A is the root, B is parented to A,
+        // C is parented to B. Render order should push A's
+        // transform before B's before rendering C.
+        let a = json!({ "ty": 99, "ind": 1, "ip": 0, "op": 60 });
+        let b = json!({ "ty": 99, "ind": 2, "parent": 1, "ip": 0, "op": 60 });
+        let c = json!({ "ty": 99, "ind": 3, "parent": 2, "ip": 0, "op": 60 });
+        let mut layers = vec![
+            Layer::from_value(&a, 60.0),
+            Layer::from_value(&b, 60.0),
+            Layer::from_value(&c, 60.0),
+        ];
+        resolve_parent_chains(&mut layers);
+        assert!(layers[0].parent_chain.is_empty());
+        assert_eq!(layers[1].parent_chain, vec![0]);
+        // C's chain: outermost (A) first, direct parent (B) last.
+        assert_eq!(layers[2].parent_chain, vec![0, 1]);
+    }
+
+    #[test]
+    fn parent_chain_handles_forward_refs_and_cycles() {
+        // Forward reference (parent's `ind` comes later in the
+        // array) resolves fine because `ind_to_index` is built
+        // before walking.
+        let a = json!({ "ty": 99, "ind": 1, "parent": 2, "ip": 0, "op": 60 });
+        let b = json!({ "ty": 99, "ind": 2, "ip": 0, "op": 60 });
+        let mut layers = vec![
+            Layer::from_value(&a, 60.0),
+            Layer::from_value(&b, 60.0),
+        ];
+        resolve_parent_chains(&mut layers);
+        assert_eq!(layers[0].parent_chain, vec![1]);
+        assert!(layers[1].parent_chain.is_empty());
+
+        // Cyclic parents drop the chain rather than looping.
+        let a = json!({ "ty": 99, "ind": 1, "parent": 2, "ip": 0, "op": 60 });
+        let b = json!({ "ty": 99, "ind": 2, "parent": 1, "ip": 0, "op": 60 });
+        let mut layers = vec![
+            Layer::from_value(&a, 60.0),
+            Layer::from_value(&b, 60.0),
+        ];
+        resolve_parent_chains(&mut layers);
+        assert!(layers[0].parent_chain.is_empty(), "cycle should drop chain");
+        assert!(layers[1].parent_chain.is_empty(), "cycle should drop chain");
+
+        // Missing parent (dangling `ind`) drops silently.
+        let c = json!({ "ty": 99, "ind": 1, "parent": 42, "ip": 0, "op": 60 });
+        let mut layers = vec![Layer::from_value(&c, 60.0)];
+        resolve_parent_chains(&mut layers);
+        assert!(layers[0].parent_chain.is_empty());
     }
 
     #[test]

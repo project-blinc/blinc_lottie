@@ -12,19 +12,25 @@ it.
 
 ## Phase 1 follow-up — Bezier easing
 
-- [ ] **Bezier easing (`i` / `o` tangents on keyframes)**
-  - **Why:** Linear keyframe interp is off-shape from the AE-authored
-    curve. Hand-animated Lotties look noticeably wrong without eases.
-  - **How:** Each keyframe carries `i: { x: [..], y: [..] }` and
-    `o: { x, y }` arrays describing the cubic bezier that maps
-    `u ∈ [0, 1]` (linear progress between keyframes) to eased progress.
-    Solve `bezier_x(t_param) = u` for `t_param` via Newton's method,
-    then evaluate `bezier_y(t_param)`. Per-component tangents
-    (`x[i]` / `y[i]` arrays) allow different eases per axis — start with
-    a shared easing (take `x[0]` / `y[0]`) and expand later.
-  - **Touches:** `src/layer.rs` — `ScalarKey` / `Vec2Key` / `Vec4Key`
-    gain optional `(in, out)` bezier control points; `sample_*` replaces
-    the linear `u` with the eased progress before the mix.
+- [x] **Bezier easing (`i` / `o` tangents on keyframes)** — shipped.
+  Each `ScalarKey` / `Vec2Key` / `Vec4Key` carries optional in/out
+  `BezierTangent` control points parsed from `i` / `o` on the
+  keyframe. `solve_bezier_ease` runs a bounded Newton's method
+  (8 iterations, early-exits on degenerate tangents) to resolve
+  `bezier_x(t) = u` before each `sample_*` mix. Per-component
+  tangents (`x: [..]`, `y: [..]`) collapse to a shared curve via
+  `scalar_or_first` — covers After Effects' "Easy Ease" preset
+  plus every authored curve we've seen in the wild. Different
+  eases per axis remains a follow-up (would require per-component
+  `sample_*` rather than a shared `u`).
+
+- [ ] **Per-axis bezier easing**
+  - **Why:** Rare but authored for position animations where X and Y
+    ease independently. Current fold-to-shared-curve is a visible
+    difference from the source tool in those cases.
+  - **How:** `Vec2Key` / `Vec4Key` grow per-component tangents;
+    `sample_vec2` / `sample_vec4` call `eased_u` once per axis
+    rather than once per segment.
 
 ---
 
@@ -117,13 +123,15 @@ it.
 - [ ] **Null layer (`ty: 3`)**
   - Transform-only parent. Zero-effort once parenting is in.
 
-- [ ] **Parenting (`parent`)**
-  - **Why:** Nearly every non-trivial Lottie uses it — transforms
-    compose up the parent chain.
-  - **How:** Resolve `parent` index at parse time into a `Option<usize>`
-    on each `Layer`. At render, compose transforms up the chain
-    before applying the layer's own. Cache composed transforms per
-    frame if perf matters later.
+- [x] **Parenting (`parent`)** — shipped. Each `Layer` carries
+  `ind` + `parent_ind` parsed from JSON plus a resolved
+  `parent_chain: Vec<usize>` (outermost ancestor first). The player
+  walks the chain per-frame, pushing each ancestor's
+  position/rotation/scale/anchor via `push_parent_transform` before
+  the child's own `push_layer_transform`. Ancestor opacity does not
+  propagate (matches After Effects convention). Forward refs
+  resolve correctly; cycles and dangling `ind` values silently
+  drop the chain so malformed exports still render.
 
 - [ ] **Precomp layers (`ty: 0`)**
   - **Why:** Nested compositions are AE's main reuse mechanism.

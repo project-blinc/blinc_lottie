@@ -146,11 +146,17 @@ impl LottiePlayer {
                 duration_seconds: m.duration_frames / fr,
             })
             .collect();
-        let layers = root
+        let mut layers: Vec<Layer> = root
             .layers
             .iter()
             .map(|v| Layer::from_value(v, fr))
             .collect();
+        // Every layer's `parent_chain` is derived from the final
+        // `Vec<Layer>`, so resolution has to run after all
+        // entries are constructed. Keep this next to `from_value`
+        // calls so a future contributor can't forget to re-run it
+        // after parse-time mutations.
+        layer::resolve_parent_chains(&mut layers);
         Self {
             root,
             layers,
@@ -294,7 +300,14 @@ impl LottiePlayer {
         dc.push_transform(Transform::translate(rect.x(), rect.y()));
         dc.push_transform(Transform::scale(sx, sy));
         for layer in self.layers.iter().rev() {
+            for &anc_idx in &layer.parent_chain {
+                let anc_xform = self.layers[anc_idx].transform.sample(scene_t);
+                layer::push_parent_transform(dc, &anc_xform);
+            }
             layer.render(dc, scene_t);
+            for _ in 0..layer.parent_chain.len() {
+                layer::pop_parent_transform(dc);
+            }
         }
         dc.pop_transform();
         dc.pop_transform();
@@ -359,9 +372,20 @@ impl Player for LottiePlayer {
 
         // Lottie convention: layers earlier in the array composite on
         // top of layers later in the array. Iterate in reverse so we
-        // draw back-to-front.
+        // draw back-to-front. For every layer, push each of its
+        // ancestors' transforms (outermost first) so the child's
+        // own `push_layer_transform` composes on top of the parent
+        // chain — this is what Lottie `parent` semantics require
+        // per the [spec](https://lottiefiles.github.io/lottie-docs/).
         for layer in self.layers.iter().rev() {
+            for &anc_idx in &layer.parent_chain {
+                let anc_xform = self.layers[anc_idx].transform.sample(scene_t);
+                layer::push_parent_transform(dc, &anc_xform);
+            }
             layer.render(dc, scene_t);
+            for _ in 0..layer.parent_chain.len() {
+                layer::pop_parent_transform(dc);
+            }
         }
 
         dc.pop_transform();
