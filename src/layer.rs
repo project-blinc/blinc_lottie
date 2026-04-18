@@ -207,8 +207,15 @@ pub(crate) enum LayerKind {
     /// Vector shape layer (`ty: 4`). Holds a tree of shape groups, each
     /// composed of geometry items + paint items (fill, stroke).
     Shape(ShapeContent),
-    /// Layer types not yet implemented (image, text, precomp, null,
-    /// …). Render as a no-op so the rest of the scene still composites
+    /// Null layer (`ty: 3`) — transform-only, renders nothing of
+    /// its own. Exists so other layers can parent to it: the null's
+    /// transform participates in its children's
+    /// [`Layer::parent_chain`], while its own `render` is a no-op.
+    /// Distinguished from [`LayerKind::Unknown`] so intent stays
+    /// readable in Debug output and asset inspections.
+    Null,
+    /// Layer types not yet implemented (image, text, precomp, …).
+    /// Render as a no-op so the rest of the scene still composites
     /// correctly.
     Unknown,
 }
@@ -229,11 +236,11 @@ pub(crate) enum LayerKind {
 /// `u ∈ [0, 1]` to eased progress. See
 /// [`solve_bezier_ease`] for the math.
 ///
-/// Per-component tangents (`x`/`y` stored separately) are a Lottie
-/// feature for axis-independent eases. We only read the first
-/// component of each array for now — shared easing covers ~99% of
-/// authored Lotties and matches After Effects' "Easy Ease"
-/// button output.
+/// Per-component tangents (`x` / `y` stored separately) are a
+/// Lottie feature for axis-independent eases. `Vec2Key` and
+/// `Vec4Key` keep per-axis tangents so each component can resolve
+/// its own curve; `ScalarKey` has only one axis of value and
+/// so needs one tangent pair.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BezierTangent {
     /// Normalized time component: where on `[0, 1]` this control
@@ -427,6 +434,24 @@ pub(crate) fn eased_u(
     }
 }
 
+/// Binary-search the keyframe index `k0` such that
+/// `keys[k0].t <= t < keys[k0+1].t`. Callers handle the before /
+/// after edge cases before dispatching here; this helper never
+/// returns the last index (no `k1` after it).
+///
+/// Replaces a linear `.windows(2)` scan — O(n) per property per
+/// frame — with `partition_point`, which is O(log n). Big win on
+/// hand-authored timelines with dozens of keyframes; no cost on
+/// the short ones (2-3 keys) since the log2 is already trivial.
+#[inline]
+fn find_segment_index<K, F: Fn(&K) -> f32>(keys: &[K], t: f32, time_of: F) -> usize {
+    // `partition_point(|k| k.t <= t)` returns the index of the first
+    // key with `t > target`, so the previous slot is `k0`. Guarded
+    // to `[1, n-1]` so `-1` and `k1 = keys[idx]` stay in bounds.
+    let idx = keys.partition_point(|k| time_of(k) <= t);
+    idx.clamp(1, keys.len() - 1) - 1
+}
+
 fn sample_scalar(keys: &[ScalarKey], t: f32) -> f32 {
     if keys.is_empty() {
         return 0.0;
@@ -438,19 +463,15 @@ fn sample_scalar(keys: &[ScalarKey], t: f32) -> f32 {
     if t >= last.t {
         return last.value;
     }
-    for pair in keys.windows(2) {
-        let k0 = &pair[0];
-        let k1 = &pair[1];
-        if t >= k0.t && t < k1.t {
-            if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
-                return k0.value;
-            }
-            let linear_u = (t - k0.t) / (k1.t - k0.t);
-            let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
-            return k0.value + (k1.value - k0.value) * u;
-        }
+    let idx = find_segment_index(keys, t, |k| k.t);
+    let k0 = &keys[idx];
+    let k1 = &keys[idx + 1];
+    if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
+        return k0.value;
     }
-    last.value
+    let linear_u = (t - k0.t) / (k1.t - k0.t);
+    let u = eased_u(linear_u, k0.out_tangent, k1.in_tangent);
+    k0.value + (k1.value - k0.value) * u
 }
 
 fn sample_vec2(keys: &[Vec2Key], t: f32) -> [f32; 2] {
@@ -464,28 +485,23 @@ fn sample_vec2(keys: &[Vec2Key], t: f32) -> [f32; 2] {
     if t >= last.t {
         return last.value;
     }
-    for pair in keys.windows(2) {
-        let k0 = &pair[0];
-        let k1 = &pair[1];
-        if t >= k0.t && t < k1.t {
-            if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
-                return k0.value;
-            }
-            let linear_u = (t - k0.t) / (k1.t - k0.t);
-            // Per-axis ease: each component resolves its own
-            // bezier curve from the (k0.out[i], k1.in[i]) pair.
-            // Shared-curve keyframes fold to identical slots at
-            // parse time, so the per-axis path stays as fast as
-            // the shared one on that common input.
-            let ux = eased_u(linear_u, k0.out_tangent[0], k1.in_tangent[0]);
-            let uy = eased_u(linear_u, k0.out_tangent[1], k1.in_tangent[1]);
-            return [
-                k0.value[0] + (k1.value[0] - k0.value[0]) * ux,
-                k0.value[1] + (k1.value[1] - k0.value[1]) * uy,
-            ];
-        }
+    let idx = find_segment_index(keys, t, |k| k.t);
+    let k0 = &keys[idx];
+    let k1 = &keys[idx + 1];
+    if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
+        return k0.value;
     }
-    last.value
+    let linear_u = (t - k0.t) / (k1.t - k0.t);
+    // Per-axis ease: each component resolves its own bezier curve
+    // from the `(k0.out[i], k1.in[i])` pair. Shared-curve keyframes
+    // fold to identical slots at parse time so the per-axis path
+    // stays as fast as the shared one on that common input.
+    let ux = eased_u(linear_u, k0.out_tangent[0], k1.in_tangent[0]);
+    let uy = eased_u(linear_u, k0.out_tangent[1], k1.in_tangent[1]);
+    [
+        k0.value[0] + (k1.value[0] - k0.value[0]) * ux,
+        k0.value[1] + (k1.value[1] - k0.value[1]) * uy,
+    ]
 }
 
 fn sample_vec4(keys: &[Vec4Key], t: f32) -> [f32; 4] {
@@ -499,29 +515,25 @@ fn sample_vec4(keys: &[Vec4Key], t: f32) -> [f32; 4] {
     if t >= last.t {
         return last.value;
     }
-    for pair in keys.windows(2) {
-        let k0 = &pair[0];
-        let k1 = &pair[1];
-        if t >= k0.t && t < k1.t {
-            if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
-                return k0.value;
-            }
-            let linear_u = (t - k0.t) / (k1.t - k0.t);
-            // Per-component ease — see `sample_vec2` for the
-            // shared-vs-per-axis folding convention.
-            let u0 = eased_u(linear_u, k0.out_tangent[0], k1.in_tangent[0]);
-            let u1 = eased_u(linear_u, k0.out_tangent[1], k1.in_tangent[1]);
-            let u2 = eased_u(linear_u, k0.out_tangent[2], k1.in_tangent[2]);
-            let u3 = eased_u(linear_u, k0.out_tangent[3], k1.in_tangent[3]);
-            return [
-                k0.value[0] + (k1.value[0] - k0.value[0]) * u0,
-                k0.value[1] + (k1.value[1] - k0.value[1]) * u1,
-                k0.value[2] + (k1.value[2] - k0.value[2]) * u2,
-                k0.value[3] + (k1.value[3] - k0.value[3]) * u3,
-            ];
-        }
+    let idx = find_segment_index(keys, t, |k| k.t);
+    let k0 = &keys[idx];
+    let k1 = &keys[idx + 1];
+    if k0.hold || (k1.t - k0.t).abs() < f32::EPSILON {
+        return k0.value;
     }
-    last.value
+    let linear_u = (t - k0.t) / (k1.t - k0.t);
+    // Per-component ease — see `sample_vec2` for the
+    // shared-vs-per-axis folding convention.
+    let u0 = eased_u(linear_u, k0.out_tangent[0], k1.in_tangent[0]);
+    let u1 = eased_u(linear_u, k0.out_tangent[1], k1.in_tangent[1]);
+    let u2 = eased_u(linear_u, k0.out_tangent[2], k1.in_tangent[2]);
+    let u3 = eased_u(linear_u, k0.out_tangent[3], k1.in_tangent[3]);
+    [
+        k0.value[0] + (k1.value[0] - k0.value[0]) * u0,
+        k0.value[1] + (k1.value[1] - k0.value[1]) * u1,
+        k0.value[2] + (k1.value[2] - k0.value[2]) * u2,
+        k0.value[3] + (k1.value[3] - k0.value[3]) * u3,
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -607,6 +619,7 @@ impl Layer {
         let transform = TransformSpec::from_value(v.get("ks"), fr);
         let kind = match ty {
             1 => parse_solid(v),
+            3 => LayerKind::Null,
             4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
             _ => LayerKind::Unknown,
         };
@@ -644,6 +657,17 @@ impl Layer {
         if scene_t < self.in_seconds || scene_t >= self.out_seconds {
             return;
         }
+        // Opacity gate: sample the transform before any allocation
+        // (effect vec, mask clip pushes) so fully-transparent layers
+        // — a common "fade-out tail" idiom — skip every downstream
+        // step. Opacity is the only transform component cheap
+        // enough to early-check before deciding to push an
+        // offscreen effects layer; position / scale / rotation
+        // would still need to draw even at an extreme value.
+        let xform = self.transform.sample(scene_t);
+        if xform.opacity <= 0.0 {
+            return;
+        }
 
         // Effect layers (`ef`) wrap the whole draw pass — transform
         // + masks + content all land inside the offscreen layer
@@ -664,7 +688,6 @@ impl Layer {
             false
         };
 
-        let xform = self.transform.sample(scene_t);
         push_layer_transform(dc, &xform);
 
         // Stack up `Add`-mode masks as `ClipShape::Path` pushes.
@@ -706,7 +729,10 @@ impl Layer {
             LayerKind::Shape(content) => {
                 content.render(dc, scene_t);
             }
-            LayerKind::Unknown => {}
+            // Null layer has no content of its own — its transform
+            // is still useful because children reference it as a
+            // parent in their `parent_chain`.
+            LayerKind::Null | LayerKind::Unknown => {}
         }
 
         for _ in 0..pushed_clips {
@@ -1343,6 +1369,55 @@ mod tests {
         });
         let layer = Layer::from_value(&v, 60.0);
         assert_eq!(layer.effects.len(), 1, "unsupported effect should drop, blur should stay");
+    }
+
+    #[test]
+    fn binary_search_finds_correct_segment_in_dense_timeline() {
+        // 5 keyframes spanning 0→4 seconds with opacity growing
+        // linearly 0→100. Binary search should find the segment
+        // (2, 3) at sample time 2.5 and return 62.5 — proves
+        // mid-array lookup works without false matches.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 240,
+            "sw": 10.0, "sh": 10.0, "sc": "#000000",
+            "ks": {
+                "o": {
+                    "a": 1,
+                    "k": [
+                        { "t": 0,   "s": [0.0]   },
+                        { "t": 60,  "s": [25.0]  },
+                        { "t": 120, "s": [50.0]  },
+                        { "t": 180, "s": [75.0]  },
+                        { "t": 240, "s": [100.0] }
+                    ]
+                }
+            }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        // 2.5s lies in segment (120f, 180f) = (2s, 3s), value
+        // 0.5 → 0.75, linear midpoint = 0.625.
+        let o = layer.transform.sample(2.5).opacity;
+        assert!((o - 0.625).abs() < 1e-5, "expected 0.625, got {o}");
+        // Exact-match on an internal keyframe time should produce
+        // that keyframe's value, not interpolate.
+        assert!((layer.transform.sample(3.0).opacity - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn null_layer_parses_as_null_kind_and_still_chains_parenting() {
+        // A null (`ty: 3`) has no content but contributes its
+        // transform to children that parent to it. `ind` still
+        // registers in the parent table.
+        let null = json!({ "ty": 3, "ind": 1, "ip": 0, "op": 60 });
+        let child = json!({ "ty": 99, "ind": 2, "parent": 1, "ip": 0, "op": 60 });
+        let mut layers = vec![
+            Layer::from_value(&null, 60.0),
+            Layer::from_value(&child, 60.0),
+        ];
+        assert!(matches!(layers[0].kind, LayerKind::Null));
+        resolve_parent_chains(&mut layers);
+        assert_eq!(layers[1].parent_chain, vec![0]);
     }
 
     #[test]

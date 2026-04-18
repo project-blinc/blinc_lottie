@@ -151,8 +151,10 @@ it.
     file references (`u: "images/", p: "img_0.png"`) after (needs a
     file-loader trait the caller can implement).
 
-- [ ] **Null layer (`ty: 3`)**
-  - Transform-only parent. Zero-effort once parenting is in.
+- [x] **Null layer (`ty: 3`)** — shipped. `LayerKind::Null`
+  renders nothing and keeps `ind` / `transform` so children can
+  reference it in their `parent_chain`. Named separately from
+  `LayerKind::Unknown` so intent reads clearly in debug output.
 
 - [x] **Parenting (`parent`)** — shipped. Each `Layer` carries
   `ind` + `parent_ind` parsed from JSON plus a resolved
@@ -248,19 +250,27 @@ it.
   serially without re-entering the FSM. Cap at `MAX_CASCADE_DEPTH`
   (32 hops) bails out of authored cycles (A → fire(A)).
 
-- [ ] **Keyframe lookup acceleration**
-  - **Why:** `sample_*` does a linear scan per property per frame. Fine
-    for short timelines, quadratic behavior on long ones with many
-    keyframes.
-  - **How:** Replace `windows(2)` scan with binary search + per-property
-    `last_index` cursor that biases the search. Also: if `t` hasn't
-    moved across a boundary, return the cached value from the previous
-    frame.
+- [x] **Keyframe lookup acceleration** — shipped. `sample_scalar`
+  / `sample_vec2` / `sample_vec4` walk keyframes via
+  `partition_point` (binary search, O(log n)) instead of the old
+  `.windows(2)` linear scan. Dense hand-authored timelines
+  (dozens of keyframes per property) now sample in constant time
+  per property regardless of position in the timeline. No cost
+  on short keyframe arrays — the log₂ is already trivial.
+
+- [x] **Opacity-zero early-out** — shipped. `Layer::render`
+  samples the transform before allocating effect vecs or pushing
+  mask clips, and returns early when the composed opacity is
+  zero. Skips every downstream step for the common "fade-out
+  tail" idiom where a layer's opacity keyframes to zero before
+  its out-point.
 
 - [ ] **Off-screen layer culling**
   - Skip `layer.render` work when the layer's transformed AABB doesn't
     intersect the destination `rect`. Needs an AABB-in-source-space
-    estimator for each `LayerKind`.
+    estimator for each `LayerKind` plus the composed-transform
+    threaded through render — larger refactor than the above
+    micro-opts.
 
 - [ ] **GPU path caching**
   - Static shape geometry (non-animated `rc`/`el`/`sh`) tessellates to
