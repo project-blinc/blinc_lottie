@@ -2,7 +2,7 @@
 //!
 //! dotLottie is a zip archive standardized by the LottieFiles community
 //! for distributing Lottie animations with bundled assets. Layout (from
-//! the [dotLottie spec](https://dotlottie.github.io/rust-player)):
+//! the [dotLottie 2.0 spec](https://dotlottie.io/spec/2.0/)):
 //!
 //! ```text
 //! <archive>.lottie

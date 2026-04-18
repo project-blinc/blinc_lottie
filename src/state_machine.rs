@@ -1,6 +1,6 @@
 //! dotLottie state-machine wrapper.
 //!
-//! [dotLottie](https://dotlottie.io/state-machines) extends the plain
+//! [dotLottie](https://dotlottie.io/spec/2.0/) extends the plain
 //! Lottie JSON format with a sibling `state_machine.json` that defines
 //! named states pointing at segments of the master animation plus
 //! event-triggered transitions between them. Common use case:

@@ -170,7 +170,7 @@ it.
   - Animated-segment markers (`"marker": "<name>"` pointing at a
     Lottie marker instead of explicit `(start, end)`).
   - Image-asset extraction from the archive for raster layers.
-  - Reference: <https://dotlottie.io/state-machines>.
+  - Reference: <https://dotlottie.io/spec/2.0/>.
 
 - [ ] **Keyframe lookup acceleration**
   - **Why:** `sample_*` does a linear scan per property per frame. Fine
