@@ -16,10 +16,10 @@
 //! | `PlaybackState`         | parsed + applied |
 //! | `GlobalState`           | parsed; transitions fire from any state |
 //! | `segment` (frames)      | parsed, converted to seconds at load |
-//! | `loop: bool`            | parsed (all segments loop today — follow-up) |
-//! | `mode` Forward          | applied |
-//! | `mode` Reverse / Bounce / ReverseBounce | parsed, not yet applied |
-//! | `speed`, `autoplay`     | parsed, not yet applied |
+//! | `loop: bool` / `loopCount` | applied — single-pass or N-pass with terminal freeze |
+//! | `mode` Forward / Reverse / Bounce / ReverseBounce | all applied |
+//! | `speed` multiplier      | applied |
+//! | `autoplay: false`       | applied — pins at starting pose until [`Player::set_playing(true)`] |
 //! | `Transition` (immediate)| parsed + applied |
 //! | `Tweened` transitions   | parsed as immediate Transition (duration + easing ignored) |
 //! | `Event` guards          | applied — `send(input_name)` matches `inputName` |
@@ -335,6 +335,25 @@ pub struct LottieStateMachine {
     /// from the JSON are converted at load using the player's
     /// [`LottiePlayer::frame_rate`].
     state_segments: HashMap<StateId, (f32, f32)>,
+    /// Per-state playback configuration (mode, loop, loopCount,
+    /// speed, autoplay). Populated at load for every
+    /// `PlaybackState` that has a segment — `GlobalState` entries
+    /// skip since they never render on their own. States without
+    /// a config fall through to the player's default clock.
+    state_playback: HashMap<StateId, StatePlayback>,
+    /// Sketch time at which the current state was entered. Used
+    /// with `state_playback[current]` to compute scene time each
+    /// frame. `None` until the first `draw_at` observes a `t`,
+    /// so a state change that happens long before the first frame
+    /// doesn't produce huge `elapsed` values on frame 0.
+    state_entered_at_t: Option<f32>,
+    /// Frozen scene time when the player is paused via
+    /// [`Player::set_playing(false)`]. `Some(t)` means render at
+    /// that exact scene time regardless of the incoming `t`;
+    /// `None` means normal playback. Resetting to `None` rebases
+    /// `state_entered_at_t` so unpausing doesn't skip ahead by
+    /// the paused duration.
+    paused_scene_t: Option<f32>,
     /// Numeric / string / boolean input store. Shared with guard
     /// and action closures inside the FSM via `Arc<Mutex<_>>`
     /// because Blinc's `Transition::with_guard` / `with_action`
@@ -369,6 +388,93 @@ pub struct LottieStateMachine {
 /// spin forever; at 32 hops we bail, leaving the machine in
 /// whatever state the cascade reached.
 const MAX_CASCADE_DEPTH: usize = 32;
+
+/// Compiled per-state playback settings. Durations are in seconds
+/// (frame values get converted at load against `LottiePlayer::frame_rate`).
+#[derive(Debug, Clone, Copy)]
+struct StatePlayback {
+    segment_start: f32,
+    segment_end: f32,
+    mode: PlaybackMode,
+    /// `true` means the segment loops indefinitely (the spec's
+    /// default). `false` pins playback at the terminal pose
+    /// after a single pass — forward-mode pauses on the last
+    /// frame, reverse-mode pauses on the first.
+    looping: bool,
+    /// If set, cap the total one-way passes through the segment.
+    /// Forward-mode playback of `loopCount: 3` plays the segment
+    /// three times then freezes. Bounce-mode counts each
+    /// direction change as a pass.
+    loop_count: Option<u32>,
+    /// Playback speed multiplier applied to the sketch-time delta.
+    /// `2.0` means half-duration playback; negative values are
+    /// clamped to zero (for reverse playback use `PlaybackMode`,
+    /// not negative speed).
+    speed: f32,
+    /// `false` means the state enters paused at its starting pose
+    /// until explicitly played via [`Player::set_playing`].
+    autoplay: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlaybackMode {
+    Forward,
+    Reverse,
+    Bounce,
+    ReverseBounce,
+}
+
+impl PlaybackMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "Reverse" => Self::Reverse,
+            "Bounce" => Self::Bounce,
+            "ReverseBounce" => Self::ReverseBounce,
+            _ => Self::Forward,
+        }
+    }
+}
+
+impl StatePlayback {
+    /// Map a non-negative elapsed time (in seconds, already
+    /// speed-scaled by the caller) onto the state's scene time.
+    /// Handles mode, loop, and loopCount in one pass so no dead
+    /// state leaks between frames.
+    fn scene_t(&self, elapsed: f32) -> f32 {
+        let duration = (self.segment_end - self.segment_start).max(f32::EPSILON);
+        let passes_f = (elapsed / duration).max(0.0);
+        let mut pass = passes_f.floor() as u32;
+        let mut phase = passes_f - pass as f32; // [0, 1)
+
+        if !self.looping && self.loop_count.is_none() {
+            // A single pass then freeze.
+            if pass > 0 {
+                pass = 0;
+                phase = 1.0;
+            }
+        } else if let Some(max) = self.loop_count {
+            // Pass index is zero-based; `max` is the count so
+            // `max - 1` is the final pass. Past the end, freeze
+            // at the terminal of that pass.
+            if max == 0 || pass >= max {
+                pass = max.saturating_sub(1);
+                phase = 1.0;
+            }
+        }
+
+        // Each "pass" through the segment alternates direction for
+        // bounce modes. Forward/Reverse keep the same direction
+        // every pass.
+        let reversed = match self.mode {
+            PlaybackMode::Forward => false,
+            PlaybackMode::Reverse => true,
+            PlaybackMode::Bounce => pass % 2 == 1,
+            PlaybackMode::ReverseBounce => pass % 2 == 0,
+        };
+        let seg_phase = if reversed { 1.0 - phase } else { phase };
+        self.segment_start + seg_phase * duration
+    }
+}
 
 /// Frozen parameters for a `Tweened` transition — precomputed at
 /// load so that `send()` can arm the tween without allocating.
@@ -478,6 +584,7 @@ impl LottieStateMachine {
         // GlobalState transitions fire from *any* state).
         let mut global_source_ids: Vec<StateId> = Vec::new();
 
+        let mut state_playback: HashMap<StateId, StatePlayback> = HashMap::new();
         for (i, entry) in spec.states.iter().enumerate() {
             let id = i as StateId;
             let name = match entry {
@@ -490,6 +597,30 @@ impl LottieStateMachine {
                         let start_s = start_f / fr;
                         let end_s = (end_f / fr).max(start_s);
                         state_segments.insert(id, (start_s, end_s));
+                        // Compile per-state playback config alongside
+                        // the segment. Defaults mirror the spec: loop
+                        // on, no loop cap, forward, speed 1×, autoplay.
+                        let looping = p.r#loop.unwrap_or(true);
+                        state_playback.insert(
+                            id,
+                            StatePlayback {
+                                segment_start: start_s,
+                                segment_end: end_s,
+                                mode: p
+                                    .mode
+                                    .as_deref()
+                                    .map(PlaybackMode::from_str)
+                                    .unwrap_or(PlaybackMode::Forward),
+                                looping,
+                                loop_count: p.loop_count,
+                                // Negative speeds aren't meaningful —
+                                // authors reverse via `mode`. Clamp
+                                // to non-negative so the elapsed math
+                                // never goes backwards on its own.
+                                speed: p.speed.unwrap_or(1.0).max(0.0),
+                                autoplay: p.autoplay.unwrap_or(true),
+                            },
+                        );
                     }
                     p.name.clone()
                 }
@@ -706,6 +837,9 @@ impl LottieStateMachine {
             state_names,
             event_names,
             state_segments,
+            state_playback,
+            state_entered_at_t: None,
+            paused_scene_t: None,
             inputs,
             defaults,
             pending_events,
@@ -721,6 +855,9 @@ impl LottieStateMachine {
             state_names: Vec::new(),
             event_names: HashMap::new(),
             state_segments: HashMap::new(),
+            state_playback: HashMap::new(),
+            state_entered_at_t: None,
+            paused_scene_t: None,
             inputs: Arc::new(Mutex::new(InputStore::default())),
             defaults: Arc::new(InputDefaults::default()),
             pending_events: Arc::new(Mutex::new(Vec::new())),
@@ -877,6 +1014,12 @@ impl LottieStateMachine {
             return false;
         }
         apply_state_segment(&mut self.player, next, &self.state_segments);
+        // Rebase the per-state clock so the destination plays from
+        // its authored starting pose. `None` defers the actual
+        // sketch-time capture to the next `draw_at` call — mirrors
+        // the tween arming pattern.
+        self.state_entered_at_t = None;
+        self.paused_scene_t = None;
         if let Some(params) = self.tween_edges.get(&(event_id, prev)) {
             if params.to_state == next && params.duration > 0.0 {
                 self.tween = Some(Tween {
@@ -889,6 +1032,32 @@ impl LottieStateMachine {
             }
         }
         true
+    }
+
+    /// Compute the effective scene time for the current state at
+    /// sketch time `t`. Returns `None` when no per-state playback
+    /// config applies (e.g. the machine has no segments, or the
+    /// loaded spec was empty) — the caller falls through to the
+    /// player's default clock.
+    fn state_scene_t(&mut self, t: f32) -> Option<f32> {
+        // Paused: return the frozen scene time regardless of `t`.
+        if let Some(frozen) = self.paused_scene_t {
+            return Some(frozen);
+        }
+        let active = self.fsm.current_state();
+        let pb = self.state_playback.get(&active).copied()?;
+        let entered = *self.state_entered_at_t.get_or_insert(t);
+        if !pb.autoplay {
+            // Stay pinned at the segment's starting pose until
+            // something external plays us. Reverse modes enter at
+            // the segment end (that's their "first pose").
+            return Some(match pb.mode {
+                PlaybackMode::Reverse | PlaybackMode::ReverseBounce => pb.segment_end,
+                _ => pb.segment_start,
+            });
+        }
+        let elapsed = (t - entered).max(0.0) * pb.speed;
+        Some(pb.scene_t(elapsed))
     }
 
     /// Whether a Tweened transition's crossfade is currently
@@ -904,11 +1073,39 @@ impl Player for LottieStateMachine {
         self.player.duration()
     }
 
+    /// Seek the current state's timeline to scene-time `t`. Rebases
+    /// `state_entered_at_t` so `draw_at` returns `t` on the next
+    /// frame with the same sketch clock, and clears any paused
+    /// pose so playback resumes from the seek.
     fn seek(&mut self, t: f32) {
+        self.paused_scene_t = None;
+        // A fresh `state_entered_at_t = None` forces the next
+        // `draw_at` to re-anchor the clock. Between now and that
+        // frame the pose is implicit — we can't render without a
+        // sketch-time reference to solve for. Delegate to the
+        // player as well so a bare `LottiePlayer::seek` remains
+        // consistent for state-machine-less archives.
+        self.state_entered_at_t = None;
         self.player.seek(t);
     }
 
+    /// Pause at the current scene time, or resume playing. Paused
+    /// state is restored scene-time-exact — no pose skip when the
+    /// host re-enables playback after a pause.
     fn set_playing(&mut self, playing: bool) {
+        if playing {
+            if self.paused_scene_t.take().is_some() {
+                // Resume: rebase the entered timestamp so the next
+                // `draw_at` doesn't observe the paused-duration's
+                // worth of elapsed time.
+                self.state_entered_at_t = None;
+            }
+        } else {
+            // Snapshot the scene time at the last `draw_at` — the
+            // player's `last_scene_t` already tracks it whether we
+            // rendered via `draw_at` or `draw_frame`.
+            self.paused_scene_t = Some(self.player.last_scene_t());
+        }
         self.player.set_playing(playing);
     }
 
@@ -917,39 +1114,57 @@ impl Player for LottieStateMachine {
     /// the destination animation by crossfading opacity over the
     /// authored `duration`.
     fn draw_at(&mut self, ctx: &mut SketchContext<'_>, rect: Rect, t: f32) {
-        // No tween in flight → straight delegation. Keeps the
-        // non-tween render path exactly as fast as the bare player.
-        let Some(tween) = self.tween.as_mut() else {
-            self.player.draw_at(ctx, rect, t);
+        // No tween: pick between per-state playback and the
+        // player's default clock based on whether we have a config
+        // for the current state.
+        if self.tween.is_none() {
+            if let Some(scene_t) = self.state_scene_t(t) {
+                self.player.draw_frame(ctx, rect, scene_t);
+                // `draw_frame` doesn't update the player's
+                // `last_scene_t`, which the pause/tween paths
+                // read. Mirror the effective scene time manually
+                // so `set_playing(false)` captures the right
+                // pose.
+                self.player.set_last_scene_t(scene_t);
+            } else {
+                self.player.draw_at(ctx, rect, t);
+            }
             return;
-        };
+        }
 
-        // Arm `started_at_t` on first frame of the tween. Using
-        // the incoming `t` instead of the moment `send()` ran
-        // means host code that calls `send()` far ahead of the
-        // first draw still sees a correctly-scaled crossfade.
-        let started = *tween.started_at_t.get_or_insert(t);
-        let raw = if tween.duration > 0.0 {
-            ((t - started) / tween.duration).clamp(0.0, 1.0)
-        } else {
-            1.0
+        // Tween path: first arm the started_at_t if this is the
+        // tween's first frame, then split behaviour on progress.
+        let (raw, from_scene_t, easing) = {
+            let tween = self.tween.as_mut().expect("tween presence checked");
+            let started = *tween.started_at_t.get_or_insert(t);
+            let raw = if tween.duration > 0.0 {
+                ((t - started) / tween.duration).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            (raw, tween.from_scene_t, tween.easing)
         };
 
         if raw >= 1.0 {
             // Tween finished — clear and render the destination
-            // normally. The destination animation's clock is
-            // already bound to its segment (set in `send()`).
+            // normally via the per-state playback path.
             self.tween = None;
-            self.player.draw_at(ctx, rect, t);
+            if let Some(scene_t) = self.state_scene_t(t) {
+                self.player.draw_frame(ctx, rect, scene_t);
+                self.player.set_last_scene_t(scene_t);
+            } else {
+                self.player.draw_at(ctx, rect, t);
+            }
             return;
         }
 
-        let progress = apply_cubic_bezier_easing(raw, tween.easing);
-        let from_scene_t = tween.from_scene_t;
+        let progress = apply_cubic_bezier_easing(raw, easing);
+        // Destination scene time — sampled the same way a non-tween
+        // draw would, so the pose matches the moment the tween
+        // ends. Falls back to `last_scene_t` when there's no
+        // per-state config (e.g. empty state machine).
+        let dest_scene_t = self.state_scene_t(t).unwrap_or(self.player.last_scene_t());
 
-        // Render source pose at (1 - progress). `draw_frame`
-        // bypasses the player's clock so the destination segment
-        // set in `send()` isn't disturbed.
         {
             let dc = ctx.draw_context();
             dc.push_opacity(1.0 - progress);
@@ -959,15 +1174,12 @@ impl Player for LottieStateMachine {
             let dc = ctx.draw_context();
             dc.pop_opacity();
         }
-
-        // Render destination at `progress`. `draw_at` advances
-        // the destination timeline by the elapsed sketch time
-        // since the tween armed.
         {
             let dc = ctx.draw_context();
             dc.push_opacity(progress);
         }
-        self.player.draw_at(ctx, rect, t);
+        self.player.draw_frame(ctx, rect, dest_scene_t);
+        self.player.set_last_scene_t(dest_scene_t);
         {
             let dc = ctx.draw_context();
             dc.pop_opacity();
@@ -1849,6 +2061,150 @@ mod tests {
         // matters is that `send` returns without hanging.
         let _ = sm.send("loop");
         assert_eq!(sm.current_state_name(), "a");
+    }
+
+    #[test]
+    fn forward_playback_loops_within_segment() {
+        // Segment [0.0, 2.0]s with default Forward + loop. Elapsed
+        // 0.5s → scene 0.5; elapsed 3.0s (past a full loop) wraps
+        // back to 1.0 (0.5 into the second pass).
+        let pb = StatePlayback {
+            segment_start: 0.0,
+            segment_end: 2.0,
+            mode: PlaybackMode::Forward,
+            looping: true,
+            loop_count: None,
+            speed: 1.0,
+            autoplay: true,
+        };
+        assert!((pb.scene_t(0.5) - 0.5).abs() < 1e-5);
+        assert!((pb.scene_t(3.0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn non_looping_forward_freezes_at_segment_end() {
+        let pb = StatePlayback {
+            segment_start: 0.0,
+            segment_end: 1.0,
+            mode: PlaybackMode::Forward,
+            looping: false,
+            loop_count: None,
+            speed: 1.0,
+            autoplay: true,
+        };
+        // Past the first pass: freeze at end.
+        assert!((pb.scene_t(5.0) - 1.0).abs() < 1e-5);
+        // Inside the first pass: normal interpolation.
+        assert!((pb.scene_t(0.25) - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn reverse_mode_plays_backward() {
+        let pb = StatePlayback {
+            segment_start: 0.0,
+            segment_end: 1.0,
+            mode: PlaybackMode::Reverse,
+            looping: true,
+            loop_count: None,
+            speed: 1.0,
+            autoplay: true,
+        };
+        // t=0 → end of segment; t=0.5 → mid; t=1 wraps to end again.
+        assert!((pb.scene_t(0.0) - 1.0).abs() < 1e-5);
+        assert!((pb.scene_t(0.5) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bounce_mode_alternates_direction() {
+        let pb = StatePlayback {
+            segment_start: 0.0,
+            segment_end: 1.0,
+            mode: PlaybackMode::Bounce,
+            looping: true,
+            loop_count: None,
+            speed: 1.0,
+            autoplay: true,
+        };
+        // Pass 0 (forward): t=0.5 → 0.5
+        assert!((pb.scene_t(0.5) - 0.5).abs() < 1e-5);
+        // Pass 1 (reverse): t=1.5 → 0.5 (halfway back)
+        assert!((pb.scene_t(1.5) - 0.5).abs() < 1e-5);
+        // End of pass 1: t=2.0 → start of segment
+        assert!((pb.scene_t(2.0) - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn loop_count_caps_total_passes() {
+        let pb = StatePlayback {
+            segment_start: 0.0,
+            segment_end: 1.0,
+            mode: PlaybackMode::Forward,
+            looping: true,
+            loop_count: Some(2),
+            speed: 1.0,
+            autoplay: true,
+        };
+        // Within 2 passes: normal.
+        assert!((pb.scene_t(1.5) - 0.5).abs() < 1e-5);
+        // Beyond the cap: freeze at terminal pose of pass 1.
+        assert!((pb.scene_t(5.0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn speed_multiplier_scales_elapsed() {
+        // Same spec-state, different speed → faster playback
+        // reaches later scene time at the same elapsed.
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "segment": [0, 120],
+                    "speed": 2.0
+                }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        let pb = sm.state_playback.get(&0).copied().expect("state playback");
+        // 0.5s elapsed at 2× should land at segment time 1.0.
+        assert!((pb.scene_t(1.0) - 1.0).abs() < 1e-5);
+        assert!((pb.speed - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn autoplay_false_pins_at_starting_pose() {
+        // `autoplay: false` → no elapsed scene_t advance; pose
+        // stays at segment start for Forward mode.
+        let spec = r#"{
+            "initial": "a",
+            "states": [
+                {
+                    "type": "PlaybackState", "name": "a", "animation": "main",
+                    "segment": [30, 90],
+                    "autoplay": false
+                }
+            ]
+        }"#;
+        let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
+        let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
+        let scene_t = sm.state_scene_t(99.0).expect("pinned scene_t");
+        // Segment [30, 90] frames at 60fps → [0.5, 1.5]s. Pinned at
+        // segment_start (0.5s) regardless of sketch time.
+        assert!((scene_t - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn reverse_mode_accepts_authored_string() {
+        assert!(matches!(PlaybackMode::from_str("Forward"), PlaybackMode::Forward));
+        assert!(matches!(PlaybackMode::from_str("Reverse"), PlaybackMode::Reverse));
+        assert!(matches!(PlaybackMode::from_str("Bounce"), PlaybackMode::Bounce));
+        assert!(matches!(
+            PlaybackMode::from_str("ReverseBounce"),
+            PlaybackMode::ReverseBounce
+        ));
+        // Unknown → fallback to Forward.
+        assert!(matches!(PlaybackMode::from_str("wat"), PlaybackMode::Forward));
     }
 
     #[test]

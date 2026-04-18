@@ -214,11 +214,22 @@ it.
     `speed`, `autoplay`; `mode` other than Forward.
 
   Follow-ups still on the table:
-  - Per-state playback modifiers: `loop: false`, `loopCount`,
-    `speed`, `Reverse` / `Bounce` / `ReverseBounce` modes.
   - Animated-segment markers (`"marker": "<name>"` pointing at a
     Lottie marker instead of explicit `[start, end]` frames).
   - Image-asset extraction from the archive for raster layers.
+
+- [x] **Per-state playback modifiers** — shipped.
+  Each `PlaybackState` with a segment compiles into a `StatePlayback`
+  (segment + mode + loop + loopCount + speed + autoplay).
+  `LottieStateMachine` now implements its own scene-time clock
+  (`state_scene_t`) and calls `LottiePlayer::draw_frame` directly
+  so the per-state config drives the pose on every frame. Modes
+  Forward / Reverse / Bounce / ReverseBounce all applied; non-
+  looping and `loopCount: N` freeze at the mode-appropriate
+  terminal pose; `autoplay: false` pins at the starting pose
+  until `Player::set_playing(true)`. `Player::seek` / `set_playing`
+  on the state machine rebase the entered timestamp so pause /
+  resume / seek stay scene-time-exact.
 
 - [x] **State machine `Fire` / `Reset` + top-level `inputs[]` seeding** — shipped.
   Top-level `inputs` array is parsed into a typed

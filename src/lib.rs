@@ -284,6 +284,15 @@ impl LottiePlayer {
         self.last_scene_t
     }
 
+    /// Override the last-rendered scene time. Set by the
+    /// state-machine wrapper after it calls `draw_frame` instead
+    /// of `draw_at`, so `last_scene_t` stays authoritative for
+    /// pause capture and marker fire calculations across both
+    /// render paths.
+    pub fn set_last_scene_t(&mut self, t: f32) {
+        self.last_scene_t = t;
+    }
+
     /// Render one frame at absolute scene time `scene_t`, bypassing
     /// the player's clock / segment / pause / markers entirely. The
     /// player's internal state is not mutated — `draw_frame` is safe
