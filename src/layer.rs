@@ -321,12 +321,11 @@ pub(crate) struct ImageSpec {
     pub rgba: Vec<u8>,
 }
 
-/// Parsed Lottie text-document payload. Covers the subset that
-/// real-world assets actually use — per-character animation
-/// (`t.p.a`) is tracked as follow-up; the spec's text-range
-/// animators (`t.a`) likewise.
+/// Single text-document snapshot (the `s` payload of one entry in
+/// `t.d.k`). Multiple of these form an [`AnimatedTextSpec`] when
+/// the author keyframes text properties over time.
 #[derive(Debug, Clone)]
-pub(crate) struct TextSpec {
+pub(crate) struct TextDoc {
     /// Literal text content. Newlines ("\r" / "\n") split into
     /// multiple lines at render time.
     pub text: String,
@@ -348,6 +347,40 @@ pub(crate) struct TextSpec {
     /// to `size * 1.2` when the JSON omits it, matching CSS
     /// convention.
     pub line_height: f32,
+}
+
+/// Keyframed text payload parsed from `t.d.k`. Step-interpolated:
+/// at any scene time, the active document is the latest keyframe
+/// whose timestamp is ≤ `t`. A single-entry array behaves exactly
+/// like static text. Text-range animators (`t.a`) that interpolate
+/// per-character transforms are tracked as follow-up — they need
+/// per-glyph transform composition that the current
+/// `DrawContext::draw_text` path doesn't expose.
+#[derive(Debug, Clone)]
+pub(crate) struct TextSpec {
+    /// `(time_seconds, doc)` pairs sorted ascending. Never empty —
+    /// parsers that produce zero keyframes fall back to
+    /// `LayerKind::Unknown` upstream.
+    pub keyframes: Vec<(f32, TextDoc)>,
+}
+
+impl TextSpec {
+    /// Active document at scene time `t`. Step interpolation —
+    /// text strings rarely interpolate meaningfully, and the
+    /// common authoring use (typewriter effects, state swaps)
+    /// already expects hard cuts between keyframes.
+    pub fn sample(&self, t: f32) -> &TextDoc {
+        // Search from the end so late keyframes win on ties.
+        // `keyframes` is parse-time sorted so a simple linear
+        // scan is fine for the handful of documents a typical
+        // Lottie carries.
+        self.keyframes
+            .iter()
+            .rev()
+            .find(|(kt, _)| *kt <= t)
+            .map(|(_, doc)| doc)
+            .unwrap_or_else(|| &self.keyframes[0].1)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -805,7 +838,7 @@ impl Layer {
             2 => parse_image_layer(v, ctx),
             3 => LayerKind::Null,
             4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
-            5 => parse_text(v).map_or(LayerKind::Unknown, LayerKind::Text),
+            5 => parse_text(v, fr).map_or(LayerKind::Unknown, LayerKind::Text),
             _ => LayerKind::Unknown,
         };
         let masks = v
@@ -899,11 +932,14 @@ impl Layer {
                 // have. Font-size × char-count × 0.8 overshoots
                 // typical widths, which means no false-culls
                 // (better than false-rendering an invisible box).
-                let lines = spec.text.lines().count().max(1) as f32;
-                let chars = spec.text.chars().count().max(1) as f32;
-                let h = spec.line_height.max(spec.size) * lines + spec.size;
-                let w = spec.size * 0.8 * chars;
-                Some(Rect::new(0.0, -spec.size, w, h))
+                // Use the document active at `scene_t` so animated
+                // text with keyframed content is bound correctly.
+                let doc = spec.sample(scene_t);
+                let lines = doc.text.lines().count().max(1) as f32;
+                let chars = doc.text.chars().count().max(1) as f32;
+                let h = doc.line_height.max(doc.size) * lines + doc.size;
+                let w = doc.size * 0.8 * chars;
+                Some(Rect::new(0.0, -doc.size, w, h))
             }
             #[cfg(feature = "images")]
             LayerKind::Image(spec) => Some(Rect::new(
@@ -1012,7 +1048,7 @@ impl Layer {
                 content.render(dc, scene_t);
             }
             LayerKind::Text(spec) => {
-                render_text_layer(dc, spec);
+                render_text_layer(dc, spec.sample(scene_t));
             }
             #[cfg(feature = "images")]
             LayerKind::Image(spec) => {
@@ -1173,24 +1209,42 @@ fn parse_precomp(v: &Value, fr: f32, ctx: Option<&AssetContext<'_>>) -> LayerKin
     }
 }
 
-/// Parse a Lottie text layer's document (`t.d.k[0].s`). The text
-/// document carries every field we actually consume — content,
-/// font family, fill color, size, justification, tracking, line
-/// height. Animated text (multiple keyframes with different
-/// strings) picks only the first keyframe here; scene-time-varying
-/// content is a follow-up.
-fn parse_text(v: &Value) -> Option<TextSpec> {
-    use blinc_core::TextAlign;
-    let doc = v
+/// Parse a Lottie text layer's document array (`t.d.k[]`). Each
+/// entry's `s` payload becomes a [`TextDoc`]; the keyframe's `t`
+/// (frames) converts to seconds using `frame_rate`. Returns
+/// `None` when no usable keyframe parses — at least one
+/// document with a non-missing `t` string is required.
+fn parse_text(v: &Value, frame_rate: f32) -> Option<TextSpec> {
+    let frames = v
         .get("t")
         .and_then(|t| t.get("d"))
         .and_then(|d| d.get("k"))
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(|frame| frame.get("s"))?;
+        .and_then(Value::as_array)?;
 
-    // `t` on the document is the literal text content. An empty or
-    // missing string renders nothing useful — treat as unparseable.
+    let fr = frame_rate.max(1.0);
+    let mut keyframes: Vec<(f32, TextDoc)> = frames
+        .iter()
+        .filter_map(|frame| {
+            let time_frames = frame.get("t").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let doc = parse_text_doc(frame.get("s")?)?;
+            Some((time_frames / fr, doc))
+        })
+        .collect();
+    if keyframes.is_empty() {
+        return None;
+    }
+    // Sort ascending so `TextSpec::sample` can short-circuit and
+    // downstream walks are deterministic. Stable sort preserves
+    // authoring order on equal timestamps.
+    keyframes.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(TextSpec { keyframes })
+}
+
+/// Parse one text-document `s` payload. Extracted so the
+/// keyframe walker and any future per-character animator share
+/// the same field mapping.
+fn parse_text_doc(doc: &Value) -> Option<TextDoc> {
+    use blinc_core::TextAlign;
     let text = doc.get("t").and_then(Value::as_str)?.to_string();
     let size = doc
         .get("s")
@@ -1211,8 +1265,6 @@ fn parse_text(v: &Value) -> Option<TextSpec> {
     let align = match doc.get("j").and_then(Value::as_u64).unwrap_or(0) {
         1 => TextAlign::Right,
         2 => TextAlign::Center,
-        // 0 (Left) and any unknown value (3/4 = RTL variants we
-        // don't special-case) fall back to Left alignment.
         _ => TextAlign::Left,
     };
     let family = doc
@@ -1231,7 +1283,7 @@ fn parse_text(v: &Value) -> Option<TextSpec> {
         .map(|n| n as f32)
         .unwrap_or(size * 1.2);
 
-    Some(TextSpec {
+    Some(TextDoc {
         text,
         size,
         color,
@@ -1661,38 +1713,33 @@ pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
     dc.pop_transform();
 }
 
-/// Render a Lottie text layer's single text document into `dc`.
-/// Splits the text on newlines so multi-line documents honour
-/// line height; positions each line's baseline at
-/// `(line_index + 1) * line_height` from the layer origin (Lottie
-/// convention: the layer's anchor is at the first line's baseline,
-/// subsequent lines descend below).
-fn render_text_layer(dc: &mut dyn DrawContext, spec: &TextSpec) {
+/// Render a Lottie text document into `dc`. Splits the text on
+/// newlines so multi-line documents honour line height; positions
+/// each line's baseline at `line_index × line_height` from the
+/// layer origin. Alphabetic baseline — matches the `TextStyle`
+/// default.
+fn render_text_layer(dc: &mut dyn DrawContext, doc: &TextDoc) {
     use blinc_core::{Color, Point, TextStyle};
-    let color = Color::rgba(spec.color[0], spec.color[1], spec.color[2], spec.color[3]);
+    let color = Color::rgba(doc.color[0], doc.color[1], doc.color[2], doc.color[3]);
     let mut style = TextStyle::default()
         .with_color(color)
-        .with_align(spec.align);
-    style.size = spec.size;
-    style.letter_spacing = spec.tracking;
-    style.line_height = if spec.size > 0.0 {
-        spec.line_height / spec.size
+        .with_align(doc.align);
+    style.size = doc.size;
+    style.letter_spacing = doc.tracking;
+    style.line_height = if doc.size > 0.0 {
+        doc.line_height / doc.size
     } else {
         1.2
     };
-    if let Some(family) = &spec.family {
+    if let Some(family) = &doc.family {
         style = style.with_family(family.clone());
     }
 
-    // Baseline y stepping: first line sits at y = 0 (the layer's
-    // anchor is on that baseline by Lottie convention); each
-    // subsequent line descends by `line_height`. Alphabetic
-    // baseline — matches the TextStyle default.
-    for (line_idx, line) in spec.text.lines().enumerate() {
+    for (line_idx, line) in doc.text.lines().enumerate() {
         if line.is_empty() {
             continue;
         }
-        let y = line_idx as f32 * spec.line_height;
+        let y = line_idx as f32 * doc.line_height;
         dc.draw_text(line, Point::new(0.0, y), &style);
     }
 }
@@ -2360,13 +2407,14 @@ mod tests {
         let layer = Layer::from_value(&v, 60.0);
         match &layer.kind {
             LayerKind::Text(spec) => {
-                assert_eq!(spec.text, "Hello");
-                assert_eq!(spec.family.as_deref(), Some("Inter"));
-                assert_eq!(spec.color, [1.0, 0.5, 0.25, 1.0]);
-                assert!((spec.size - 36.0).abs() < 1e-6);
-                assert!(matches!(spec.align, TextAlign::Center));
-                assert!((spec.tracking - 50.0).abs() < 1e-6);
-                assert!((spec.line_height - 48.0).abs() < 1e-6);
+                let doc = spec.sample(0.0);
+                assert_eq!(doc.text, "Hello");
+                assert_eq!(doc.family.as_deref(), Some("Inter"));
+                assert_eq!(doc.color, [1.0, 0.5, 0.25, 1.0]);
+                assert!((doc.size - 36.0).abs() < 1e-6);
+                assert!(matches!(doc.align, TextAlign::Center));
+                assert!((doc.tracking - 50.0).abs() < 1e-6);
+                assert!((doc.line_height - 48.0).abs() < 1e-6);
             }
             other => panic!("expected Text, got {other:?}"),
         }
@@ -2385,17 +2433,17 @@ mod tests {
         let b = Layer::from_value(&mk(1), 60.0);
         let c = Layer::from_value(&mk(2), 60.0);
         if let LayerKind::Text(s) = &a.kind {
-            assert!(matches!(s.align, TextAlign::Left));
+            assert!(matches!(s.sample(0.0).align, TextAlign::Left));
         } else {
             panic!();
         }
         if let LayerKind::Text(s) = &b.kind {
-            assert!(matches!(s.align, TextAlign::Right));
+            assert!(matches!(s.sample(0.0).align, TextAlign::Right));
         } else {
             panic!();
         }
         if let LayerKind::Text(s) = &c.kind {
-            assert!(matches!(s.align, TextAlign::Center));
+            assert!(matches!(s.sample(0.0).align, TextAlign::Center));
         } else {
             panic!();
         }
@@ -2419,10 +2467,66 @@ mod tests {
         match &layer.kind {
             LayerKind::Text(spec) => {
                 // Missing `lh` → 1.2 * size
-                assert!((spec.line_height - 24.0).abs() < 1e-5);
+                let doc = spec.sample(0.0);
+                assert!((doc.line_height - 24.0).abs() < 1e-5);
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn animated_text_steps_between_keyframes() {
+        // Two-keyframe text: "Hello" at t=0, "World" at t=30 (0.5s
+        // at 60fps). Step interpolation — "Hello" before 0.5s,
+        // "World" at or after.
+        let v = json!({
+            "ty": 5, "ip": 0, "op": 60,
+            "t": {
+                "d": {
+                    "k": [
+                        { "t": 0,  "s": { "t": "Hello", "s": 20.0 } },
+                        { "t": 30, "s": { "t": "World", "s": 20.0 } }
+                    ]
+                }
+            }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        let LayerKind::Text(spec) = &layer.kind else {
+            panic!("expected Text");
+        };
+        assert_eq!(spec.keyframes.len(), 2);
+        assert_eq!(spec.sample(0.0).text, "Hello");
+        assert_eq!(spec.sample(0.25).text, "Hello");
+        // Exactly at 0.5s the second keyframe takes over.
+        assert_eq!(spec.sample(0.5).text, "World");
+        assert_eq!(spec.sample(10.0).text, "World");
+    }
+
+    #[test]
+    fn animated_text_keyframes_stay_sorted() {
+        // Author emits keyframes out of order — our parser sorts
+        // them so `sample` walks them consistently.
+        let v = json!({
+            "ty": 5, "ip": 0, "op": 60,
+            "t": {
+                "d": {
+                    "k": [
+                        { "t": 60, "s": { "t": "Third", "s": 20.0 } },
+                        { "t": 0,  "s": { "t": "First", "s": 20.0 } },
+                        { "t": 30, "s": { "t": "Second", "s": 20.0 } }
+                    ]
+                }
+            }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        let LayerKind::Text(spec) = &layer.kind else {
+            panic!("expected Text");
+        };
+        let times: Vec<f32> = spec.keyframes.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![0.0, 0.5, 1.0]);
+        assert_eq!(spec.sample(0.0).text, "First");
+        assert_eq!(spec.sample(0.75).text, "Second");
+        assert_eq!(spec.sample(2.0).text, "Third");
     }
 
     #[test]
