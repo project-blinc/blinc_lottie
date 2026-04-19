@@ -54,6 +54,14 @@ pub(crate) struct LottieRoot {
     /// crosses their timestamps.
     #[serde(default)]
     pub markers: Vec<RawMarker>,
+
+    /// Precomp / image asset table. Each entry is keyed by `id` and
+    /// may carry either a nested `layers` array (precomposition — a
+    /// reusable sub-scene referenced by `ty: 0` layers via `refId`)
+    /// or a `p` / `u` pair pointing at an image file. Opaque JSON so
+    /// the parser tolerates asset kinds we don't consume yet.
+    #[serde(default)]
+    pub assets: Vec<serde_json::Value>,
 }
 
 /// Raw marker as it appears in the JSON — frame-based. Converted to the

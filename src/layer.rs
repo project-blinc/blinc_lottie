@@ -214,7 +214,31 @@ pub(crate) enum LayerKind {
     /// Distinguished from [`LayerKind::Unknown`] so intent stays
     /// readable in Debug output and asset inspections.
     Null,
-    /// Layer types not yet implemented (image, text, precomp, …).
+    /// Precomp layer (`ty: 0`) — a nested sub-composition referenced
+    /// by `refId` into the root `assets` table. Renders its own
+    /// layer stack at a remapped scene time, clipped to the
+    /// precomp's `w` × `h` bounds. AE's main reuse mechanism —
+    /// nearly every non-trivial asset uses it.
+    Precomp {
+        /// Parsed child layers in render order (Lottie convention:
+        /// index 0 composites on top, matches the root).
+        layers: Vec<Layer>,
+        /// Precomp's own canvas size. Children draw in a `[0, 0, w, h]`
+        /// local space which the render path clips to; larger
+        /// children spill off as they would in AE.
+        width: f32,
+        height: f32,
+        /// Start-time offset in **seconds** (`st` field, frame-based
+        /// in the JSON, converted at parse). The child composition's
+        /// scene time is `(outer_scene_t - start) * time_stretch`.
+        start_seconds: f32,
+        /// Animatable time-remap in seconds (`tm` field). When set,
+        /// the child scene time samples from this curve instead of
+        /// the straight `outer - start` derivation — used for
+        /// scrubs, loops, and speed ramps on the precomp's timeline.
+        time_remap: Option<AnimatedF32>,
+    },
+    /// Layer types not yet implemented (image, text, …).
     /// Render as a no-op so the rest of the scene still composites
     /// correctly.
     Unknown,
@@ -607,17 +631,61 @@ pub(crate) struct SampledTransform {
 // Layer lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Maximum depth of nested precomp references. Beyond this any
+/// further precomp resolves to a `LayerKind::Unknown` rather than
+/// recursing — guards against authored cycles (A refers to B, B
+/// refers to A) without paying a HashSet walk per layer.
+pub(crate) const MAX_PRECOMP_DEPTH: u8 = 8;
+
+/// Context threaded through `Layer::from_value` so precomp
+/// resolution can look up child compositions in the root `assets`
+/// table. Borrowed for the duration of parsing; the resolved
+/// layers own their parsed content so the JSON can be dropped.
+pub(crate) struct AssetContext<'a> {
+    /// Map from precomp `id` (author-assigned) to its parsed
+    /// `layers` array in JSON form. Plain slices because each
+    /// precomp's layer vec is itself parsed through `from_value`,
+    /// which would recurse if the context held fully resolved
+    /// trees upfront.
+    pub precomp_layers: std::collections::HashMap<String, &'a [Value]>,
+    /// Depth of the current precomp resolution — incremented
+    /// before each recursion, compared against [`MAX_PRECOMP_DEPTH`]
+    /// to bail out of authored cycles.
+    pub depth: u8,
+}
+
 impl Layer {
     /// Build a typed layer from a raw JSON object. `frame_rate` is used
     /// to convert the Lottie frame-based `ip`/`op` and keyframe times
-    /// into seconds.
+    /// into seconds. Precomp layers resolve their child compositions
+    /// through [`Layer::from_value_with_assets`]; the shorter entry
+    /// treats `ty: 0` as `Unknown`.
+    ///
+    /// Callers that already have an asset table should use
+    /// `from_value_with_assets` directly; this entry exists for
+    /// tests and stand-alone layer parsing where `refId` resolution
+    /// isn't needed.
+    #[allow(dead_code)]
     pub fn from_value(v: &Value, frame_rate: f32) -> Self {
+        Self::from_value_with_assets(v, frame_rate, None)
+    }
+
+    /// Build a layer with a precomp asset table in scope. When a
+    /// `ty: 0` (precomp) layer is encountered the referenced
+    /// composition's layers are parsed recursively; the depth
+    /// counter in `ctx` bounds cycles.
+    pub fn from_value_with_assets(
+        v: &Value,
+        frame_rate: f32,
+        ctx: Option<&AssetContext<'_>>,
+    ) -> Self {
         let fr = frame_rate.max(1.0);
         let ty = v.get("ty").and_then(Value::as_u64).unwrap_or(99);
         let in_frames = v.get("ip").and_then(Value::as_f64).unwrap_or(0.0) as f32;
         let out_frames = v.get("op").and_then(Value::as_f64).unwrap_or(0.0) as f32;
         let transform = TransformSpec::from_value(v.get("ks"), fr);
         let kind = match ty {
+            0 => parse_precomp(v, fr, ctx),
             1 => parse_solid(v),
             3 => LayerKind::Null,
             4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
@@ -668,6 +736,16 @@ impl Layer {
                 Some(Rect::new(0.0, 0.0, *width, *height))
             }
             LayerKind::Shape(content) => content.local_bounds(scene_t),
+            LayerKind::Precomp { width, height, .. } => {
+                // Precomps clip to their authored canvas size, so
+                // that rect is a tight cull bound regardless of
+                // what the children draw.
+                if *width <= 0.0 || *height <= 0.0 {
+                    None
+                } else {
+                    Some(Rect::new(0.0, 0.0, *width, *height))
+                }
+            }
             // Null renders nothing of its own; Unknown is
             // conservative (can't know the extent of a layer type
             // we don't parse). Both return None so the player
@@ -757,6 +835,46 @@ impl Layer {
             LayerKind::Shape(content) => {
                 content.render(dc, scene_t);
             }
+            LayerKind::Precomp {
+                layers,
+                width,
+                height,
+                start_seconds,
+                time_remap,
+            } => {
+                // Clip children to the precomp's own canvas bounds.
+                // Content drawn outside `[0, 0, w, h]` is cropped,
+                // matching AE's precomposition viewport.
+                dc.push_clip(ClipShape::Rect(Rect::new(0.0, 0.0, *width, *height)));
+
+                // Child scene time: start from an `st` offset
+                // (Lottie's "start time" remap — pushes the child
+                // timeline earlier / later in the outer composition)
+                // and, if a `tm` track is present, substitute the
+                // remapped value so scrubbed / eased / looped
+                // timelines honour the author's curve.
+                let child_t = match time_remap {
+                    Some(remap) => remap.sample(scene_t),
+                    None => scene_t - start_seconds,
+                };
+
+                // Render child layers in Lottie's back-to-front
+                // convention. Parent chains are scoped to this
+                // precomp's layer vec (resolved at parse).
+                for (i, child) in layers.iter().enumerate().rev() {
+                    for &anc_idx in &child.parent_chain {
+                        let anc_xform = layers[anc_idx].transform.sample(child_t);
+                        push_parent_transform(dc, &anc_xform);
+                    }
+                    let _ = i;
+                    child.render(dc, child_t);
+                    for _ in 0..child.parent_chain.len() {
+                        pop_parent_transform(dc);
+                    }
+                }
+
+                dc.pop_clip();
+            }
             // Null layer has no content of its own — its transform
             // is still useful because children reference it as a
             // parent in their `parent_chain`.
@@ -809,6 +927,52 @@ fn parse_mask(v: &Value, fr: f32) -> MaskSpec {
         path,
         opacity,
         invert,
+    }
+}
+
+/// Resolve a precomp layer's `refId` against the parser's asset
+/// table, recursively parsing the referenced composition's layers.
+/// Returns `LayerKind::Unknown` when the asset is missing, the
+/// context is absent (`from_value` without `from_value_with_assets`),
+/// or we've hit the max nesting depth.
+fn parse_precomp(v: &Value, fr: f32, ctx: Option<&AssetContext<'_>>) -> LayerKind {
+    let Some(ctx) = ctx else {
+        return LayerKind::Unknown;
+    };
+    if ctx.depth >= MAX_PRECOMP_DEPTH {
+        return LayerKind::Unknown;
+    }
+    let Some(ref_id) = v.get("refId").and_then(Value::as_str) else {
+        return LayerKind::Unknown;
+    };
+    let Some(child_raw) = ctx.precomp_layers.get(ref_id).copied() else {
+        return LayerKind::Unknown;
+    };
+    // Recurse with an incremented depth so cycles terminate.
+    let inner_ctx = AssetContext {
+        precomp_layers: ctx.precomp_layers.clone(),
+        depth: ctx.depth + 1,
+    };
+    let mut child_layers: Vec<Layer> = child_raw
+        .iter()
+        .map(|layer_v| Layer::from_value_with_assets(layer_v, fr, Some(&inner_ctx)))
+        .collect();
+    // Recursively resolve parent chains inside the precomp. Each
+    // precomp has its own `ind` namespace so this walk is scoped to
+    // the child layers, not the outer composition.
+    resolve_parent_chains(&mut child_layers);
+
+    let width = v.get("w").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    let height = v.get("h").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    let start_frames = v.get("st").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    let time_remap = v.get("tm").and_then(|tm| parse_animated_scalar(Some(tm), fr));
+
+    LayerKind::Precomp {
+        layers: child_layers,
+        width,
+        height,
+        start_seconds: start_frames / fr,
+        time_remap,
     }
 }
 
@@ -1645,6 +1809,109 @@ mod tests {
         let unknown = json!({ "ty": 99, "ip": 0, "op": 60 });
         assert!(Layer::from_value(&null, 60.0).source_bounds(0.0).is_none());
         assert!(Layer::from_value(&unknown, 60.0).source_bounds(0.0).is_none());
+    }
+
+    #[test]
+    fn precomp_resolves_child_layers_from_asset_table() {
+        use std::collections::HashMap;
+        let child_layers = vec![
+            json!({ "ty": 1, "ind": 1, "ip": 0, "op": 60, "sw": 100.0, "sh": 100.0, "sc": "#ff0000" }),
+            json!({ "ty": 1, "ind": 2, "ip": 0, "op": 60, "sw": 50.0, "sh": 50.0, "sc": "#00ff00" }),
+        ];
+        let mut ctx_layers: HashMap<String, &[serde_json::Value]> = HashMap::new();
+        ctx_layers.insert("child_comp".to_string(), child_layers.as_slice());
+        let ctx = AssetContext {
+            precomp_layers: ctx_layers,
+            depth: 0,
+        };
+
+        let precomp = json!({
+            "ty": 0,
+            "refId": "child_comp",
+            "w": 200.0,
+            "h": 150.0,
+            "ip": 0, "op": 60,
+            "st": 30,
+        });
+        let layer = Layer::from_value_with_assets(&precomp, 60.0, Some(&ctx));
+        match &layer.kind {
+            LayerKind::Precomp {
+                layers,
+                width,
+                height,
+                start_seconds,
+                ..
+            } => {
+                assert_eq!(*width, 200.0);
+                assert_eq!(*height, 150.0);
+                // `st: 30` frames at 60 fps → 0.5s offset.
+                assert!((start_seconds - 0.5).abs() < 1e-5);
+                assert_eq!(layers.len(), 2);
+                assert!(matches!(layers[0].kind, LayerKind::Solid { .. }));
+                assert!(matches!(layers[1].kind, LayerKind::Solid { .. }));
+            }
+            other => panic!("expected Precomp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precomp_without_asset_context_falls_back_to_unknown() {
+        // `Layer::from_value` (without context) can't resolve
+        // `refId`, so precomp layers render as no-ops. The layer
+        // still parses its transform / in-out points.
+        let precomp = json!({
+            "ty": 0, "refId": "missing", "w": 100.0, "h": 100.0,
+            "ip": 0, "op": 60,
+        });
+        let layer = Layer::from_value(&precomp, 60.0);
+        assert!(matches!(layer.kind, LayerKind::Unknown));
+    }
+
+    #[test]
+    fn precomp_cycle_terminates_at_max_depth() {
+        use std::collections::HashMap;
+        // Two precomps that reference each other — authoring
+        // mistake, but has to terminate. `a → b → a → b → …`
+        // resolves to the deepest-but-one as Unknown.
+        let a_layers = vec![json!({
+            "ty": 0, "refId": "b", "w": 100.0, "h": 100.0,
+            "ip": 0, "op": 60,
+        })];
+        let b_layers = vec![json!({
+            "ty": 0, "refId": "a", "w": 100.0, "h": 100.0,
+            "ip": 0, "op": 60,
+        })];
+        let mut ctx_layers: HashMap<String, &[serde_json::Value]> = HashMap::new();
+        ctx_layers.insert("a".to_string(), a_layers.as_slice());
+        ctx_layers.insert("b".to_string(), b_layers.as_slice());
+        let ctx = AssetContext {
+            precomp_layers: ctx_layers,
+            depth: 0,
+        };
+        let outer = json!({
+            "ty": 0, "refId": "a", "w": 100.0, "h": 100.0,
+            "ip": 0, "op": 60,
+        });
+        let layer = Layer::from_value_with_assets(&outer, 60.0, Some(&ctx));
+        // The outer precomp resolved, but the chain bottoms out in
+        // `Unknown` before runaway recursion crashes the stack.
+        let mut kind_ref = &layer.kind;
+        let mut depth = 0;
+        while let LayerKind::Precomp { layers, .. } = kind_ref {
+            if layers.is_empty() {
+                break;
+            }
+            depth += 1;
+            kind_ref = &layers[0].kind;
+            // A pathological max; real tree should terminate well
+            // before MAX_PRECOMP_DEPTH + 2.
+            if depth > MAX_PRECOMP_DEPTH as usize + 4 {
+                panic!("precomp cycle didn't terminate");
+            }
+        }
+        // Bottom of the chain is `Unknown` (depth cap hit).
+        assert!(matches!(kind_ref, LayerKind::Unknown));
+        assert!(depth <= MAX_PRECOMP_DEPTH as usize);
     }
 
     #[test]

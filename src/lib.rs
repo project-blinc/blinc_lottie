@@ -146,10 +146,31 @@ impl LottiePlayer {
                 duration_seconds: m.duration_frames / fr,
             })
             .collect();
+        // Build the precomp asset lookup — every entry in `assets`
+        // that carries a `layers` array is a precomposition
+        // referenceable by `ty: 0` layers via `refId`. Image-asset
+        // entries (`p` / `u`) parse into the same array but don't
+        // match here because they lack `layers`.
+        let mut precomp_layers: std::collections::HashMap<String, &[serde_json::Value]> =
+            std::collections::HashMap::new();
+        for asset in &root.assets {
+            let Some(id) = asset.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(layers_arr) = asset.get("layers").and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            precomp_layers.insert(id.to_string(), layers_arr.as_slice());
+        }
+        let asset_ctx = layer::AssetContext {
+            precomp_layers,
+            depth: 0,
+        };
         let mut layers: Vec<Layer> = root
             .layers
             .iter()
-            .map(|v| Layer::from_value(v, fr))
+            .map(|v| Layer::from_value_with_assets(v, fr, Some(&asset_ctx)))
             .collect();
         // Every layer's `parent_chain` is derived from the final
         // `Vec<Layer>`, so resolution has to run after all

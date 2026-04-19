@@ -158,13 +158,18 @@ it.
   resolve correctly; cycles and dangling `ind` values silently
   drop the chain so malformed exports still render.
 
-- [ ] **Precomp layers (`ty: 0`)**
-  - **Why:** Nested compositions are AE's main reuse mechanism.
-  - **How:** `assets` array can contain precomp assets (same shape
-    as root `layers`). A precomp layer renders its child composition
-    with its own timeline (clipped by the layer's `ip`/`op`). Recursive
-    render into a child `LottiePlayer`-like struct, or flatten at parse
-    time.
+- [x] **Precomp layers (`ty: 0`)** — shipped.
+  `LottieRoot.assets` now parses; entries with a `layers` array
+  become precomposition sources keyed by `id`. `Layer::from_value_with_assets`
+  threads an `AssetContext` through parsing so `ty: 0` layers
+  resolve their `refId` into a parsed child layer vec. Each child
+  vec runs its own `resolve_parent_chains` pass (precomps have
+  their own `ind` namespace). At render, the precomp pushes a
+  rect clip at `[0, 0, w, h]`, remaps scene time via
+  `scene_t - start_seconds` (or the animatable `tm` track when
+  present), and walks the child layers back-to-front with their
+  own parent-chain transforms. `MAX_PRECOMP_DEPTH` (8) bounds
+  authored cycles without paying a HashSet walk per layer.
 
 - [ ] **Track mattes (`tt`)**
   - **Why:** Alpha / luma masking between adjacent layers.
