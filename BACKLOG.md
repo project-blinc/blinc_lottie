@@ -38,26 +38,17 @@ it.
 
 ## Phase 2 — Path geometry
 
-- [ ] **Path shape (`sh`)**
-  - **Why:** Hand-drawn shapes (logos, icons, organic forms) are all
-    path-based. Rect/ellipse covers only boxy iconography.
-  - **How:** `sh.ks.k` is a `{ v, i, o, c }` struct where `v` is an
-    array of vertex positions, `i`/`o` are per-vertex in/out tangent
-    offsets (relative to the vertex), and `c` is a close flag. Build a
-    Blinc `Path` walking vertex N to N+1 as
-    `cubic_to(v[n]+o[n], v[n+1]+i[n+1], v[n+1])`.
-  - **Animatable:** when `a: 1`, `k` is keyframed — interpolate per
-    vertex (same vertex count across keys is common; add assertion +
-    warn otherwise, and pin to the last keyframe that matches).
-  - **Touches:** new `Geometry::Path { ... }` variant in `src/shape.rs`;
-    new `AnimatedPath` type (needs its own keyframe struct since
-    linear interpolation of `Vec<VertexCubicSegment>` is not a flat
-    `[f32; N]`).
+- [x] **Path shape (`sh`)** — shipped. `Geometry::Path(AnimatedPath)`
+  parses `sh.ks.k` as `{ v, i, o, c }` vertices + per-vertex tangent
+  offsets, then emits a Blinc `Path` walking vertex N→N+1 via
+  `cubic_to(v[n]+o[n], v[n+1]+i[n+1], v[n+1])`. Close flag `c`
+  stitches the last segment back to the first.
 
-- [ ] **Animated path morphing**
-  - Subset of the path shape once `sh` lands: keyframes with matching
-    vertex counts lerp per-vertex. Different vertex counts between
-    keyframes are out of scope (rare, documented as unsupported).
+- [x] **Animated path morphing** — shipped. `AnimatedPath::Keyframed`
+  interpolates between keyframes with matching vertex counts via
+  per-vertex `PathShape::lerp`. Keyframes with different vertex
+  counts fall back to the earlier keyframe (documented as
+  unsupported — authoring tools rarely emit vertex-count mismatches).
 
 - [x] **Trim paths (`tm`)** — shipped. `ShapeGroup.trim` carries
   parsed start / end / offset animatable scalars. At render the
@@ -89,22 +80,19 @@ it.
 
 ## Phase 3 — Visual effects
 
-- [ ] **Gradient fill (`gf`) and gradient stroke (`gs`)**
-  - **Why:** Replaces flat colors in most stylized designs.
-  - **How:** Lottie encodes gradient stops as a flattened
-    `[t0, r0, g0, b0, t1, r1, g1, b1, ...]` array inside `g.k.k`. Type
-    `t` is 1 (linear) or 2 (radial); endpoints `s`/`e` are animatable
-    points. Map to `Gradient::Linear` / `Gradient::Radial` brushes on
-    the Blinc side. Stop alphas live after the color stops in the same
-    array — parse both and attach.
+- [x] **Gradient fill (`gf`) and gradient stroke (`gs`)** — shipped.
+  `parse_gradient_fill` / `parse_gradient_stroke` produce
+  `Paint::LinearGradient` / `Paint::RadialGradient` from the
+  flattened `[t0, r0, g0, b0, …]` stop array. Alpha stops fold into
+  the per-stop alpha at parse time. Animatable `s` / `e` endpoint
+  points sample per-frame through the same
+  `sample_paint_brush` path that solid fills use.
 
-- [ ] **Stroke dash patterns, line caps, line joins**
-  - **Why:** Matters for dashed outlines, rounded pen strokes.
-  - **How:** `st.d` is an array of `{ n: "d"/"g", v: { k: <num> } }`
-    entries (dash, gap, offset). `lc` / `lj` fields carry enum indices
-    for caps (`butt`/`round`/`square`) and joins (`miter`/`round`/
-    `bevel`). Blinc's `Stroke` builder already supports all three —
-    just plumb the values through.
+- [x] **Stroke dash patterns, line caps, line joins** — shipped.
+  `StrokeSpec` carries `dash_pattern` (parsed from `st.d` alternating
+  dash/gap entries), animatable `dash_offset` (the `"o"` entry in
+  `st.d`), `cap` (`lc` enum), `join` (`lj` enum), and `miter_limit`
+  (`ml`). All feed Blinc's `Stroke` builder verbatim.
 
 - [x] **Drop shadow / blur effect layers** — shipped. Each
   `Layer` parses `ef` into `Vec<EffectSpec>`; rendering wraps the
@@ -125,12 +113,16 @@ it.
     authoring tools emit it as a Tritone + Gaussian Blur chain.
     When the format settles, map to `LayerEffect::Glow`.
 
-- [ ] **Masks (`masksProperties`)**
-  - **Why:** Required for any scene with clipped content.
-  - **How:** Each mask is a path + mode (`add` / `subtract` /
-    `intersect`). For the single-mask case, push it through Blinc's
-    clip-path system (`ClipShape::Polygon`). Multi-mask + track-matte
-    (adjacent-layer alpha/luma) is Phase 4.
+- [x] **Masks (`masksProperties`)** — shipped. `MaskSpec` carries
+  mode (`add` / `subtract` / `intersect` / `lighten` / `darken` /
+  `difference`), an `AnimatedPath`, animatable opacity, and an
+  invert flag. `Layer::render` pushes each mask's sampled path as
+  a `ClipShape::Path` onto the DrawContext's clip stack; sequential
+  pushes already intersect at the renderer level so the default
+  Add-mode "all masks combine with AND" semantics hold. Non-Add
+  modes collapse to Add as the forgiving fallback — proper
+  subtract / intersect / luma modes need an offscreen composite
+  pass (tracked alongside track mattes).
 
 ---
 
