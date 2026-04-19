@@ -400,6 +400,21 @@ impl ShapeContent {
             group.render(dc, t);
         }
     }
+
+    /// Local-frame AABB over every group in the content tree. Each
+    /// group contributes its own post-transform bounds (including
+    /// the `tr` shape item's displacement) and its children
+    /// recursively. Returns `None` when the content has nothing
+    /// paintable — the layer then declines the cull decision.
+    pub(crate) fn local_bounds(&self, t: f32) -> Option<Rect> {
+        let mut out: Option<Rect> = None;
+        for group in &self.groups {
+            if let Some(b) = group.local_bounds(t) {
+                out = Some(merge_rects(out, b));
+            }
+        }
+        out
+    }
 }
 
 impl ShapeGroup {
@@ -465,6 +480,49 @@ impl ShapeGroup {
             pop_layer_transform(dc);
         }
     }
+
+    /// Union of every geometry and nested-group bound, propagated
+    /// through this group's own `tr` transform if it has one.
+    /// Geometry contributes its pre-trim bounds — computing the
+    /// trimmed arc-length sub-path would be expensive and the
+    /// author's trim window never extends past the original
+    /// shape, so the pre-trim bound is a correct superset.
+    fn local_bounds(&self, t: f32) -> Option<Rect> {
+        let mut out: Option<Rect> = None;
+        for geo in &self.geometries {
+            if let Some(b) = geo.local_bounds(t) {
+                out = Some(merge_rects(out, b));
+            }
+        }
+        for child in &self.children {
+            if let Some(b) = child.local_bounds(t) {
+                out = Some(merge_rects(out, b));
+            }
+        }
+        // Apply group-level `tr` transform to the aggregated
+        // bounds. Rotation can expand the AABB; we take the
+        // axis-aligned box around the 4 transformed corners.
+        if let (Some(rect), Some(ts)) = (out, self.transform.as_ref()) {
+            let xf = ts.sample(t);
+            out = Some(transform_rect_aabb(&xf, rect));
+        }
+        out
+    }
+}
+
+fn merge_rects(existing: Option<Rect>, next: Rect) -> Rect {
+    match existing {
+        Some(prev) => prev.union(&next),
+        None => next,
+    }
+}
+
+/// AABB of `rect` after applying group-level transform `xform`.
+/// Thin wrapper over the shared helpers in [`crate::layer`] —
+/// kept here so shape.rs doesn't have to know about `Affine2D`.
+fn transform_rect_aabb(xform: &crate::layer::SampledTransform, rect: Rect) -> Rect {
+    let affine = crate::layer::layer_local_affine(xform);
+    crate::layer::transform_rect_through_affine(&affine, rect)
 }
 
 /// Arc-length window in normalized `[0, 1]` coordinates, ready for
@@ -723,6 +781,70 @@ impl Geometry {
             Geometry::Path(animated) => animated.sample(t).to_path(),
         }
     }
+
+    /// Axis-aligned bounds in the geometry's local frame (before
+    /// the enclosing group's `tr` transform is applied). Returns
+    /// `None` for degenerate inputs (empty path, zero-size rect /
+    /// ellipse) so the caller can skip a bogus zero-rect union.
+    ///
+    /// Path bounds include each vertex plus its in/out tangent
+    /// offset — cubic handles can extend the curve past the vertex
+    /// convex hull, and culling must never false-positive.
+    fn local_bounds(&self, t: f32) -> Option<Rect> {
+        match self {
+            Geometry::Rectangle { position, size, .. } => {
+                let p = position.sample(t);
+                let s = size.sample(t);
+                if s[0] <= 0.0 || s[1] <= 0.0 {
+                    return None;
+                }
+                Some(Rect::new(p[0] - s[0] * 0.5, p[1] - s[1] * 0.5, s[0], s[1]))
+            }
+            Geometry::Ellipse { position, size } => {
+                let p = position.sample(t);
+                let s = size.sample(t);
+                if s[0] <= 0.0 || s[1] <= 0.0 {
+                    return None;
+                }
+                Some(Rect::new(p[0] - s[0] * 0.5, p[1] - s[1] * 0.5, s[0], s[1]))
+            }
+            Geometry::Path(animated) => path_bounds(&animated.sample(t)),
+        }
+    }
+}
+
+/// Bounds over a `PathShape`'s vertices + per-vertex tangent
+/// handles. Including the handles keeps strongly-curved paths
+/// from false-culling when a control point extends past the
+/// vertex ring (common on bulbous "puddle" or "speech bubble"
+/// shapes). Absolute handle position = vertex + tangent offset.
+fn path_bounds(shape: &PathShape) -> Option<Rect> {
+    if shape.vertices.is_empty() {
+        return None;
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut fold = |x: f32, y: f32| {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    };
+    for (i, v) in shape.vertices.iter().enumerate() {
+        fold(v[0], v[1]);
+        if let Some(out_t) = shape.out_tangents.get(i) {
+            fold(v[0] + out_t[0], v[1] + out_t[1]);
+        }
+        if let Some(in_t) = shape.in_tangents.get(i) {
+            fold(v[0] + in_t[0], v[1] + in_t[1]);
+        }
+    }
+    if !min_x.is_finite() {
+        return None;
+    }
+    Some(Rect::new(min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0)))
 }
 
 /// Build a closed cubic-bezier approximation of an axis-aligned ellipse.

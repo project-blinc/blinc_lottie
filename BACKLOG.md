@@ -265,12 +265,21 @@ it.
   tail" idiom where a layer's opacity keyframes to zero before
   its out-point.
 
-- [ ] **Off-screen layer culling**
-  - Skip `layer.render` work when the layer's transformed AABB doesn't
-    intersect the destination `rect`. Needs an AABB-in-source-space
-    estimator for each `LayerKind` plus the composed-transform
-    threaded through render — larger refactor than the above
-    micro-opts.
+- [x] **Off-screen layer culling** — shipped.
+  `Layer::source_bounds(scene_t)` returns a local-space AABB per
+  `LayerKind` (Solid → exact; Shape → union of geometry bounds
+  walked through each group's `tr` transform; Null / Unknown →
+  `None` so the layer always renders). At draw time, the player
+  composes `DrawContext::current_transform()` (root + parent chain)
+  with the layer's own `push_layer_transform` affine via
+  `layer_local_affine` + `multiply_affines`, transforms the 4
+  corners through it, and intersects the resulting AABB with the
+  destination `Rect`. Culled layers skip `layer.render` entirely,
+  avoiding the `push_layer` offscreen setup for effect wraps.
+  Path bounds include in/out tangent handles so strongly-curved
+  `sh` shapes can't false-cull. 3D parent transforms fall through
+  to always-render — projecting an `Affine2D·Mat4` composition
+  onto the 2D screen rect isn't worth the complexity.
 
 - [ ] **GPU path caching**
   - Static shape geometry (non-animated `rc`/`el`/`sh`) tessellates to

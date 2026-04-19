@@ -308,10 +308,16 @@ impl LottiePlayer {
         let dc: &mut dyn DrawContext = ctx.draw_context();
         dc.push_transform(Transform::translate(rect.x(), rect.y()));
         dc.push_transform(Transform::scale(sx, sy));
-        for layer in self.layers.iter().rev() {
+        for (i, layer) in self.layers.iter().enumerate().rev() {
             for &anc_idx in &layer.parent_chain {
                 let anc_xform = self.layers[anc_idx].transform.sample(scene_t);
                 layer::push_parent_transform(dc, &anc_xform);
+            }
+            if cull_layer(&self.layers, i, dc, rect, scene_t) {
+                for _ in 0..layer.parent_chain.len() {
+                    layer::pop_parent_transform(dc);
+                }
+                continue;
             }
             layer.render(dc, scene_t);
             for _ in 0..layer.parent_chain.len() {
@@ -386,10 +392,22 @@ impl Player for LottiePlayer {
         // own `push_layer_transform` composes on top of the parent
         // chain — this is what Lottie `parent` semantics require
         // per the [spec](https://lottiefiles.github.io/lottie-docs/).
-        for layer in self.layers.iter().rev() {
+        // After the parent chain is on the stack, `cull_layer`
+        // consults `dc.current_transform()` + the layer's own
+        // affine to decide whether to skip the expensive content
+        // render. Parent-chain push/pop still happens for culled
+        // layers — it's cheap compared to `push_layer`'s
+        // offscreen setup for shadow / blur effects.
+        for (i, layer) in self.layers.iter().enumerate().rev() {
             for &anc_idx in &layer.parent_chain {
                 let anc_xform = self.layers[anc_idx].transform.sample(scene_t);
                 layer::push_parent_transform(dc, &anc_xform);
+            }
+            if cull_layer(&self.layers, i, dc, rect, scene_t) {
+                for _ in 0..layer.parent_chain.len() {
+                    layer::pop_parent_transform(dc);
+                }
+                continue;
             }
             layer.render(dc, scene_t);
             for _ in 0..layer.parent_chain.len() {
@@ -425,6 +443,40 @@ impl Player for LottiePlayer {
             Some(self.last_scene_t)
         };
     }
+}
+
+/// Should `layers[i]` skip its content render because its
+/// composed-world AABB lies entirely outside the destination
+/// `dest` rect? Returns `true` only when the layer provides a
+/// `source_bounds` **and** the parent-chain-composed affine
+/// maps that bound out of screen — layers without known bounds
+/// (Null / Unknown) fall through to always-render, matching
+/// correctness over throughput.
+///
+/// Caller has already pushed the parent chain on `dc`, so
+/// `dc.current_transform()` gives `root · parent_chain`; this
+/// helper composes the layer's own `push_layer_transform` matrix
+/// on top without touching the stack (pure math over `Affine2D`).
+/// 3D parent transforms short-circuit to `false` — we can't cheaply
+/// project a 3D affine-plus-perspective onto the 2D screen rect.
+fn cull_layer(
+    layers: &[Layer],
+    idx: usize,
+    dc: &mut dyn blinc_core::DrawContext,
+    dest: Rect,
+    scene_t: f32,
+) -> bool {
+    let layer = &layers[idx];
+    let Some(bounds) = layer.source_bounds(scene_t) else {
+        return false;
+    };
+    let parent = match dc.current_transform() {
+        Transform::Affine2D(a) => a,
+        Transform::Mat4(_) => return false,
+    };
+    let local = layer::layer_local_affine(&layer.transform.sample(scene_t));
+    let composed = layer::multiply_affines(&parent, &local);
+    !layer::transformed_aabb_intersects(&composed, bounds, &dest)
 }
 
 #[cfg(test)]

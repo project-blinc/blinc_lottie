@@ -17,7 +17,7 @@
 //! no-ops.
 
 use blinc_core::draw::{LayerConfig, LayerEffect, Transform};
-use blinc_core::layer::{Brush, ClipShape, Color, CornerRadius, Rect};
+use blinc_core::layer::{Affine2D, Brush, ClipShape, Color, CornerRadius, Point, Rect};
 use blinc_core::DrawContext;
 use serde_json::Value;
 
@@ -648,6 +648,34 @@ impl Layer {
         }
     }
 
+    /// Bounding box of this layer's renderable content in its own
+    /// local coordinate frame (before `transform` is applied). Used
+    /// by the player's off-screen cull: the caller transforms these
+    /// corners through the layer's composed world affine and
+    /// checks the AABB against the destination rect.
+    ///
+    /// Returns `None` for layers whose extent can't be computed
+    /// cheaply (unknown content types, null transforms). The cull
+    /// treats `None` as "don't cull" so unfamiliar content still
+    /// draws — correctness over throughput.
+    ///
+    /// Path bounds include tangent control points so strongly-curved
+    /// `sh` shapes don't false-cull when a control handle extends
+    /// beyond the vertex convex hull.
+    pub fn source_bounds(&self, scene_t: f32) -> Option<Rect> {
+        match &self.kind {
+            LayerKind::Solid { width, height, .. } => {
+                Some(Rect::new(0.0, 0.0, *width, *height))
+            }
+            LayerKind::Shape(content) => content.local_bounds(scene_t),
+            // Null renders nothing of its own; Unknown is
+            // conservative (can't know the extent of a layer type
+            // we don't parse). Both return None so the player
+            // doesn't base a cull decision on missing data.
+            LayerKind::Null | LayerKind::Unknown => None,
+        }
+    }
+
     /// Render this layer into `dc` at scene time `scene_t`.
     ///
     /// Drawing happens in source-space coordinates; the caller is
@@ -1129,6 +1157,93 @@ pub(crate) fn pop_parent_transform(dc: &mut dyn DrawContext) {
     dc.pop_transform();
 }
 
+/// Build the 2×3 affine that [`push_layer_transform`] would apply
+/// to the stack, without touching the DrawContext. The stack pushes
+/// `T(p) · R(r) · S(s) · T(-a)` in that order, so the composed
+/// point-apply is `p + R · S · (x - a)`. Collapsing into the
+/// `[a, b, c, d, tx, ty]` form Blinc uses gives the elements
+/// below.
+///
+/// Used by the AABB cull to compose a layer's local-to-parent
+/// affine with the parent chain's `current_transform()` so the
+/// screen-space bounds can be checked before the expensive
+/// `push_layer` / `push_clip` setup.
+pub(crate) fn layer_local_affine(xform: &SampledTransform) -> Affine2D {
+    let sx = xform.scale[0];
+    let sy = xform.scale[1];
+    let c = xform.rotation.cos();
+    let s = xform.rotation.sin();
+    let ax = xform.anchor[0];
+    let ay = xform.anchor[1];
+    Affine2D {
+        elements: [
+            c * sx,
+            s * sx,
+            -s * sy,
+            c * sy,
+            xform.position[0] - c * sx * ax + s * sy * ay,
+            xform.position[1] - s * sx * ax - c * sy * ay,
+        ],
+    }
+}
+
+/// Multiply two affines in the `left · right` order the transform
+/// stack uses: applying the composed affine to a point p produces
+/// `left · (right · p)`. Mirrors the push-semantics of
+/// `DrawContext::push_transform` so `multiply_affines(parent,
+/// child)` matches the `current_transform` one would observe after
+/// pushing child on top of parent.
+pub(crate) fn multiply_affines(left: &Affine2D, right: &Affine2D) -> Affine2D {
+    let [a0, a1, a2, a3, a4, a5] = left.elements;
+    let [b0, b1, b2, b3, b4, b5] = right.elements;
+    Affine2D {
+        elements: [
+            a0 * b0 + a2 * b1,
+            a1 * b0 + a3 * b1,
+            a0 * b2 + a2 * b3,
+            a1 * b2 + a3 * b3,
+            a0 * b4 + a2 * b5 + a4,
+            a1 * b4 + a3 * b5 + a5,
+        ],
+    }
+}
+
+/// Transform the 4 corners of `source` through `affine` and return
+/// the axis-aligned bounding box of the transformed points.
+/// Correct under rotation + non-uniform scale — the transformed
+/// shape is a parallelogram, but its surrounding AABB is exactly
+/// the min/max of the 4 corner x/y values.
+pub(crate) fn transform_rect_through_affine(affine: &Affine2D, source: Rect) -> Rect {
+    let [a, b, c, d, tx, ty] = affine.elements;
+    let apply = |x: f32, y: f32| Point::new(a * x + c * y + tx, b * x + d * y + ty);
+    let x0 = source.x();
+    let y0 = source.y();
+    let x1 = x0 + source.width();
+    let y1 = y0 + source.height();
+    let corners = [apply(x0, y0), apply(x1, y0), apply(x1, y1), apply(x0, y1)];
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in corners {
+        min_x = min_x.min(p.x);
+        max_x = max_x.max(p.x);
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+    Rect::new(min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0))
+}
+
+/// Transform `source` through `affine` and check whether the
+/// resulting AABB intersects `dest`. Thin wrapper over
+/// [`transform_rect_through_affine`] + `Rect::intersects` that
+/// reads cleanly at the cull site.
+pub(crate) fn transformed_aabb_intersects(
+    affine: &Affine2D,
+    source: Rect,
+    dest: &Rect,
+) -> bool {
+    transform_rect_through_affine(affine, source).intersects(dest)
+}
+
 /// Populate every layer's `parent_chain` from its `parent_ind`.
 /// Walks the chain one hop at a time, guarded against cycles and
 /// forward references to missing `ind` values; in either case the
@@ -1402,6 +1517,134 @@ mod tests {
         // Exact-match on an internal keyframe time should produce
         // that keyframe's value, not interpolate.
         assert!((layer.transform.sample(3.0).opacity - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn layer_local_affine_matches_push_semantics() {
+        // Identity transform: affine should be the identity matrix.
+        let identity = SampledTransform {
+            anchor: [0.0, 0.0],
+            position: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let a = layer_local_affine(&identity);
+        assert!((a.elements[0] - 1.0).abs() < 1e-6);
+        assert!((a.elements[3] - 1.0).abs() < 1e-6);
+        assert!(a.elements[1].abs() < 1e-6);
+        assert!(a.elements[2].abs() < 1e-6);
+        assert!(a.elements[4].abs() < 1e-6);
+        assert!(a.elements[5].abs() < 1e-6);
+
+        // Translation: point (0, 0) in source space should land at
+        // the translation values after applying the affine.
+        let translated = SampledTransform {
+            anchor: [0.0, 0.0],
+            position: [10.0, 20.0],
+            scale: [1.0, 1.0],
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let a = layer_local_affine(&translated);
+        let applied_x = a.elements[0] * 0.0 + a.elements[2] * 0.0 + a.elements[4];
+        let applied_y = a.elements[1] * 0.0 + a.elements[3] * 0.0 + a.elements[5];
+        assert!((applied_x - 10.0).abs() < 1e-6);
+        assert!((applied_y - 20.0).abs() < 1e-6);
+
+        // 90° rotation around origin (anchor at origin): point (1, 0)
+        // should land near (0, 1).
+        let rotated = SampledTransform {
+            anchor: [0.0, 0.0],
+            position: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            rotation: std::f32::consts::FRAC_PI_2,
+            opacity: 1.0,
+        };
+        let a = layer_local_affine(&rotated);
+        let rx = a.elements[0] * 1.0 + a.elements[2] * 0.0 + a.elements[4];
+        let ry = a.elements[1] * 1.0 + a.elements[3] * 0.0 + a.elements[5];
+        assert!(rx.abs() < 1e-5, "rotated x ≈ 0, got {rx}");
+        assert!((ry - 1.0).abs() < 1e-5, "rotated y ≈ 1, got {ry}");
+    }
+
+    #[test]
+    fn multiply_affines_composes_like_stack() {
+        // Translate(10) then translate(5): composed is translate(15).
+        let a = Affine2D {
+            elements: [1.0, 0.0, 0.0, 1.0, 10.0, 0.0],
+        };
+        let b = Affine2D {
+            elements: [1.0, 0.0, 0.0, 1.0, 5.0, 0.0],
+        };
+        let c = multiply_affines(&a, &b);
+        // Apply to (0, 0): should land at 15 — translate-order is
+        // parent · child, so result = parent(child(p)).
+        let rx = c.elements[0] * 0.0 + c.elements[2] * 0.0 + c.elements[4];
+        assert!((rx - 15.0).abs() < 1e-6, "expected 15, got {rx}");
+    }
+
+    #[test]
+    fn transformed_aabb_rejects_offscreen_rect() {
+        // A 10×10 source rect translated 1000px to the right. The
+        // composed AABB sits at [1000, 1010] on the x axis and
+        // doesn't intersect a destination rect at [0, 100].
+        let offscreen = Affine2D {
+            elements: [1.0, 0.0, 0.0, 1.0, 1000.0, 0.0],
+        };
+        let source = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let dest = Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert!(!transformed_aabb_intersects(&offscreen, source, &dest));
+
+        // Same source translated just inside: (95, 0) with size
+        // (10, 10) crosses the dest's right edge — visible.
+        let partially = Affine2D {
+            elements: [1.0, 0.0, 0.0, 1.0, 95.0, 0.0],
+        };
+        assert!(transformed_aabb_intersects(&partially, source, &dest));
+    }
+
+    #[test]
+    fn transformed_aabb_expands_under_rotation() {
+        // 10×10 rect rotated 45° has an AABB roughly 14.14 wide
+        // because corners stick out. Check that a destination just
+        // outside the axis-aligned bound but inside the rotated
+        // bound still reports visible.
+        let rotation = std::f32::consts::FRAC_PI_4;
+        let c = rotation.cos();
+        let s = rotation.sin();
+        let rotate_45 = Affine2D {
+            elements: [c, s, -s, c, 0.0, 0.0],
+        };
+        let source = Rect::new(-5.0, -5.0, 10.0, 10.0);
+        // Destination at (6, 0, 1, 1) is past the un-rotated 10×10
+        // but inside the rotated AABB (which reaches ~7.07 from
+        // origin). Should be visible.
+        let dest = Rect::new(6.0, 0.0, 1.0, 1.0);
+        assert!(transformed_aabb_intersects(&rotate_45, source, &dest));
+    }
+
+    #[test]
+    fn source_bounds_for_solid_is_exact() {
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 120.0, "sh": 80.0, "sc": "#aabbcc"
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        let b = layer.source_bounds(0.0).expect("solid has bounds");
+        assert_eq!(b.x(), 0.0);
+        assert_eq!(b.y(), 0.0);
+        assert_eq!(b.width(), 120.0);
+        assert_eq!(b.height(), 80.0);
+    }
+
+    #[test]
+    fn source_bounds_for_null_and_unknown_is_none() {
+        let null = json!({ "ty": 3, "ip": 0, "op": 60 });
+        let unknown = json!({ "ty": 99, "ip": 0, "op": 60 });
+        assert!(Layer::from_value(&null, 60.0).source_bounds(0.0).is_none());
+        assert!(Layer::from_value(&unknown, 60.0).source_bounds(0.0).is_none());
     }
 
     #[test]
