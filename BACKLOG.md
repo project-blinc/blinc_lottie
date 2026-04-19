@@ -157,13 +157,19 @@ it.
 - [x] **Image layers (`ty: 2`)** — shipped.
   `LayerKind::Image(Arc<ImageSpec>)` pulls from a pre-decoded
   asset table assembled at load time. `decode_image_assets`
-  handles base64 data URIs directly via `blinc_image::ImageData`,
-  and consults an archive callback for external references —
-  `.lottie` archives surface `i/<filename>` entries keyed by
-  filename through `DotLottieArchive.images`, which
-  `from_dotlottie_bytes` threads into the decode pass. Plain-JSON
-  callers that want external-file loading can patch
-  `from_root_with_images` with a real file-backed callback.
+  handles base64 data URIs directly via `blinc_image::ImageData`
+  and routes external references through a caller-provided
+  loader closure. Three entry points:
+  - `LottiePlayer::from_bytes` / `from_json` — no loader;
+    external refs drop to `Unknown`.
+  - `LottiePlayer::from_bytes_with_loader` / `from_json_with_loader`
+    — caller supplies `FnMut(&str, &str) -> Option<Vec<u8>>`
+    taking `(u, p)` and returning raw image bytes (filesystem
+    read, HTTP fetch, custom cache — host's choice).
+  - `LottiePlayer::from_dotlottie_bytes` — pre-wired with a
+    loader that looks up `i/<filename>` in the archive's own
+    image table.
+
   Gated behind the `images` feature (on by default) so
   vector-only consumers shed the image-decoding deps with
   `default-features = false`. Render uploads via

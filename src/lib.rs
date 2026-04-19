@@ -110,6 +110,39 @@ impl LottiePlayer {
         Ok(Self::from_root(root))
     }
 
+    /// Parse a Lottie scene with a caller-provided image loader.
+    /// The loader receives each external asset's `u` (directory
+    /// prefix, e.g. `"images/"`) and `p` (filename, e.g.
+    /// `"img_0.png"`) and returns the raw image bytes if the
+    /// caller can resolve them — typically read from disk, fetch
+    /// from a URL, or decode from a cache. Returning `None` leaves
+    /// the layer as [`LayerKind::Unknown`] (same outcome as a
+    /// plain `from_bytes` where external refs never resolve).
+    ///
+    /// Embedded data-URI assets (`e: 1` + `p: "data:..."`) skip
+    /// the loader entirely — they're decoded inline via
+    /// `blinc_image`. The loader only fires for external
+    /// references.
+    #[cfg(feature = "images")]
+    pub fn from_bytes_with_loader<F>(src: &[u8], loader: F) -> Result<Self, Error>
+    where
+        F: FnMut(&str, &str) -> Option<Vec<u8>>,
+    {
+        let root: parser::LottieRoot = serde_json::from_slice(src)?;
+        Ok(Self::from_root_with_loader(root, loader))
+    }
+
+    /// Same as [`Self::from_bytes_with_loader`] but takes a
+    /// [`&str`] JSON source.
+    #[cfg(feature = "images")]
+    pub fn from_json_with_loader<F>(src: &str, loader: F) -> Result<Self, Error>
+    where
+        F: FnMut(&str, &str) -> Option<Vec<u8>>,
+    {
+        let root: parser::LottieRoot = serde_json::from_str(src)?;
+        Ok(Self::from_root_with_loader(root, loader))
+    }
+
     /// Parse a `.lottie` (dotLottie 2.0) archive into a player.
     ///
     /// The archive layout follows the [spec](https://dotlottie.io/spec/2.0/):
@@ -135,29 +168,37 @@ impl LottiePlayer {
         let root: parser::LottieRoot = serde_json::from_slice(animation_bytes)?;
         #[cfg(feature = "images")]
         {
-            Ok(Self::from_root_with_images(root, Some(&archive.images)))
+            // Resolve external `assets[].p` references against the
+            // archive's own `i/<filename>` entries.
+            let images = archive.images;
+            Ok(Self::from_root_with_loader(root, move |_u, p| {
+                images.get(p).cloned()
+            }))
         }
         #[cfg(not(feature = "images"))]
-        Ok(Self::from_root_with_images(root, None))
+        Ok(Self::from_root(root))
     }
 
     fn from_root(root: parser::LottieRoot) -> Self {
-        Self::from_root_with_images(root, None)
+        #[cfg(feature = "images")]
+        {
+            Self::from_root_with_loader(root, |_, _| None)
+        }
+        #[cfg(not(feature = "images"))]
+        Self::from_root_no_images(root)
     }
 
-    /// Shared load path with an optional external image map. Plain
-    /// JSON loaders pass `None`; the `.lottie` archive path passes
-    /// `Some(&archive.images)`, keyed by `i/<filename>` so
-    /// `assets[].p` references resolve against the archived raster
-    /// bytes. Build path ignores `archive_images` when the `images`
-    /// feature is disabled.
-    fn from_root_with_images(
-        root: parser::LottieRoot,
-        #[cfg(feature = "images")] archive_images: Option<
-            &std::collections::HashMap<String, Vec<u8>>,
-        >,
-        #[cfg(not(feature = "images"))] _archive_images: Option<()>,
-    ) -> Self {
+    /// Shared load path with a caller-provided image loader. The
+    /// loader resolves external asset references (those not
+    /// carried as base64 data URIs) by whatever mechanism suits
+    /// the host — filesystem read, HTTP fetch, archive lookup,
+    /// cache probe. Embedded data-URI assets short-circuit before
+    /// the loader fires.
+    #[cfg(feature = "images")]
+    fn from_root_with_loader<F>(root: parser::LottieRoot, mut loader: F) -> Self
+    where
+        F: FnMut(&str, &str) -> Option<Vec<u8>>,
+    {
         let fr = root.frame_rate.max(1.0);
         let markers = root
             .markers
@@ -188,13 +229,12 @@ impl LottiePlayer {
         // Image assets (`ty: 2` layer references) decode once here
         // so render is decode-free. `decode_image_assets` handles
         // base64 data URIs directly; external-file references
-        // consult the archive callback (plain JSON passes `None`;
-        // `.lottie` archives pass `i/<filename>` raw bytes keyed
-        // by filename).
-        #[cfg(feature = "images")]
-        let image_assets = layer::decode_image_assets(&root.assets, |_u, p| {
-            archive_images.and_then(|map| map.get(p).cloned())
-        });
+        // consult the caller-provided `loader` (plain JSON: no-op
+        // closure that returns `None`; `.lottie` archive: looks
+        // up `i/<filename>` in the archive's pre-extracted map;
+        // user-facing `from_*_with_loader`: whatever the host
+        // implemented — filesystem read, fetch, etc.).
+        let image_assets = layer::decode_image_assets(&root.assets, |u, p| loader(u, p));
 
         let asset_ctx = layer::AssetContext {
             precomp_layers,
@@ -215,6 +255,58 @@ impl LottiePlayer {
         // `is_matte_source` is set both from the direct `td` flag
         // and from the implicit "layer after a `tt`-bearing one"
         // convention.
+        layer::resolve_parent_chains(&mut layers);
+        layer::resolve_matte_pairs(&mut layers);
+        Self {
+            root,
+            layers,
+            markers,
+            is_playing: true,
+            seek_offset: 0.0,
+            paused_at: None,
+            last_scene_t: 0.0,
+            marker_callback: None,
+            segment: None,
+        }
+    }
+
+    /// Image-free load path used when the `images` feature is
+    /// disabled. Duplicates the parser + parent/matte-chain setup
+    /// from `from_root_with_loader` without pulling in `blinc_image`
+    /// — cheapest way to keep vector-only consumers buildable.
+    #[cfg(not(feature = "images"))]
+    fn from_root_no_images(root: parser::LottieRoot) -> Self {
+        let fr = root.frame_rate.max(1.0);
+        let markers = root
+            .markers
+            .iter()
+            .map(|m| Marker {
+                name: m.name.clone().unwrap_or_default(),
+                time_seconds: m.time_frames / fr,
+                duration_seconds: m.duration_frames / fr,
+            })
+            .collect();
+        let mut precomp_layers: std::collections::HashMap<String, &[serde_json::Value]> =
+            std::collections::HashMap::new();
+        for asset in &root.assets {
+            let Some(id) = asset.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(layers_arr) = asset.get("layers").and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            precomp_layers.insert(id.to_string(), layers_arr.as_slice());
+        }
+        let asset_ctx = layer::AssetContext {
+            precomp_layers,
+            depth: 0,
+        };
+        let mut layers: Vec<Layer> = root
+            .layers
+            .iter()
+            .map(|v| Layer::from_value_with_assets(v, fr, Some(&asset_ctx)))
+            .collect();
         layer::resolve_parent_chains(&mut layers);
         layer::resolve_matte_pairs(&mut layers);
         Self {
@@ -683,6 +775,68 @@ mod tests {
             seen_cb.lock().unwrap().push(m.name.clone());
         });
         (p, seen)
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn from_json_with_loader_resolves_external_images() {
+        // 1×1 PNG inline as raw bytes (same payload as the
+        // canonical test PNG blinc_image uses). The loader
+        // returns these bytes when the asset asks for
+        // `images/img_0.png`; `decode_image_assets` then decodes
+        // them into the image asset map.
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0xfc, 0xff, 0x9f, 0xa1, 0x1e, 0x00, 0x07, 0x82, 0x02, 0x7f, 0xcf, 0x48,
+            0xb6, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let src = r#"{
+            "v": "5.0", "fr": 60, "ip": 0, "op": 60,
+            "w": 100, "h": 100,
+            "assets": [
+                { "id": "pixel", "w": 1, "h": 1, "u": "images/", "p": "img_0.png", "e": 0 }
+            ],
+            "layers": [
+                { "ty": 2, "refId": "pixel", "ind": 1, "ip": 0, "op": 60, "ks": {} }
+            ]
+        }"#;
+        let loader_calls: std::cell::RefCell<Vec<(String, String)>> =
+            std::cell::RefCell::new(Vec::new());
+        let player = LottiePlayer::from_json_with_loader(src, |u, p| {
+            loader_calls.borrow_mut().push((u.to_string(), p.to_string()));
+            if p == "img_0.png" {
+                Some(PNG_BYTES.to_vec())
+            } else {
+                None
+            }
+        })
+        .expect("player loads");
+        let calls = loader_calls.into_inner();
+        assert_eq!(calls.len(), 1, "loader called exactly once");
+        assert_eq!(calls[0], ("images/".to_string(), "img_0.png".to_string()));
+        assert_eq!(player.layer_count(), 1);
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn from_bytes_without_loader_leaves_external_images_unresolved() {
+        // Same asset layout, but `from_bytes` (no loader) means
+        // external refs never resolve — the image layer drops to
+        // `Unknown` but the player still loads.
+        let src = br#"{
+            "v": "5.0", "fr": 60, "ip": 0, "op": 60,
+            "w": 100, "h": 100,
+            "assets": [
+                { "id": "pixel", "w": 1, "h": 1, "u": "images/", "p": "img_0.png", "e": 0 }
+            ],
+            "layers": [
+                { "ty": 2, "refId": "pixel", "ind": 1, "ip": 0, "op": 60, "ks": {} }
+            ]
+        }"#;
+        let player = LottiePlayer::from_bytes(src).expect("player loads");
+        assert_eq!(player.layer_count(), 1);
     }
 
     #[test]
