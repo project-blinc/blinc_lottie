@@ -80,16 +80,12 @@ struct TrimPathSpec {
     start: AnimatedF32,
     end: AnimatedF32,
     offset: AnimatedF32,
-    /// `m: 1` = "Simultaneously" (all geometry paths treated as one
-    /// concatenated path for trim purposes). `m: 2` = "Individually"
-    /// (each geometry trimmed on its own). We implement Individually
-    /// first since it's equivalent for single-path groups (the
-    /// common case) and skips the flatten-everything-into-one-buffer
-    /// step. Simultaneously falls back to Individually — assets
-    /// that explicitly set `m: 1` on multi-geometry groups will
-    /// trim each path independently until the concatenation path
-    /// lands.
-    #[allow(dead_code)]
+    /// `m: 1` = "Simultaneously" (all geometry paths concatenated
+    /// and trimmed as one arc-length chain). `m: 2` =
+    /// "Individually" (each geometry trimmed on its own). Both
+    /// modes are applied — the simultaneous path produces a
+    /// single `Path` from all geometry commands and runs
+    /// `apply_trim` once against the unified arc length.
     mode: TrimMode,
 }
 
@@ -454,29 +450,58 @@ impl ShapeGroup {
             .is_some();
 
         // Sample the trim window once per frame so every geometry
-        // in the group sees the same cut. `Simultaneous` mode is
-        // documented as equivalent to `Individual` here — that
-        // choice matches single-path groups exactly (the common
-        // case) and only differs on multi-path groups where the
-        // author expected all paths to share arc-length 0–1.
+        // in the group sees the same cut.
         let trim_window = self
             .trim
             .as_ref()
             .map(|tm| sample_trim_window(tm, t))
             .filter(|window| window.has_visible_range());
+        let trim_mode = self.trim.as_ref().map(|tm| tm.mode);
 
-        for geo in &self.geometries {
-            let raw = geo.to_path(t);
-            let path = match &trim_window {
-                Some(window) => apply_trim(&raw, *window),
-                None => raw,
-            };
+        // Assemble the paths that this group will paint. For
+        // `Simultaneous` mode we concatenate every geometry's
+        // commands into a single `Path`, trim that, and paint once
+        // — the `s` and `e` percentages span the TOTAL arc length
+        // across all geometries, which is what AE's "Simultaneously"
+        // option produces. For `Individual` (or no trim) we keep
+        // the per-geometry loop so paths that are drawn with
+        // different fills / strokes still render separately.
+        let paths_to_paint: Vec<Path> = match (trim_window, trim_mode) {
+            (Some(window), Some(TrimMode::Simultaneous)) => {
+                // Concatenate every geometry's commands into one path.
+                let mut combined: Vec<PathCommand> = Vec::new();
+                for geo in &self.geometries {
+                    for cmd in geo.to_path(t).commands() {
+                        combined.push(cmd.clone());
+                    }
+                }
+                if combined.is_empty() {
+                    Vec::new()
+                } else {
+                    let one = Path::from_commands(combined);
+                    vec![apply_trim(&one, window)]
+                }
+            }
+            _ => self
+                .geometries
+                .iter()
+                .map(|geo| {
+                    let raw = geo.to_path(t);
+                    match trim_window {
+                        Some(window) => apply_trim(&raw, window),
+                        None => raw,
+                    }
+                })
+                .collect(),
+        };
+
+        for path in &paths_to_paint {
             if path.is_empty() {
                 continue;
             }
             if let Some(fill) = &self.fill {
                 let brush = sample_paint_brush(&fill.paint, &fill.opacity, t);
-                dc.fill_path(&path, brush);
+                dc.fill_path(path, brush);
             }
             if let Some(stroke) = &self.stroke {
                 let width = stroke.width.sample(t).max(0.0);
@@ -492,7 +517,7 @@ impl ShapeGroup {
                             stroke.dash_offset.sample(t),
                         );
                     }
-                    dc.stroke_path(&path, &builder, brush);
+                    dc.stroke_path(path, &builder, brush);
                 }
             }
         }
@@ -669,14 +694,80 @@ fn apply_trim(path: &Path, window: TrimWindow) -> Path {
     if window.is_identity() {
         return path.clone();
     }
+    // Flatten every subpath and compute the TOTAL arc length
+    // across all of them up front. The window percentages map to
+    // absolute arc lengths against that total — so a two-subpath
+    // input shares a single arc-length chain rather than each
+    // subpath being normalised independently. This matches AE's
+    // trim-path-on-concatenation semantics for both the
+    // Simultaneous mode (where callers concatenate multiple
+    // geometries into one `Path` before calling) and the
+    // single-geometry multi-subpath case.
+    let subpaths: Vec<Vec<Point>> = flatten_subpaths(path)
+        .into_iter()
+        .filter(|p| p.len() >= 2)
+        .collect();
+    if subpaths.is_empty() {
+        return Path::new();
+    }
+    let subpath_lengths: Vec<f32> = subpaths.iter().map(|p| polyline_length(p)).collect();
+    let total: f32 = subpath_lengths.iter().sum();
+    if total < 1e-6 {
+        return Path::new();
+    }
+
+    let s_abs = window.start * total;
+    let e_abs = window.end * total;
     let mut out = Path::new();
-    for points in flatten_subpaths(path) {
-        if points.len() < 2 {
-            continue;
-        }
-        emit_trimmed_subpath(&mut out, &points, window);
+    if window.start <= window.end {
+        emit_absolute_slice(&mut out, &subpaths, &subpath_lengths, s_abs, e_abs);
+    } else {
+        // Offset folded the window across the 0/1 boundary — emit
+        // the tail of the chain followed by the head as two
+        // separate subpaths.
+        emit_absolute_slice(&mut out, &subpaths, &subpath_lengths, s_abs, total);
+        emit_absolute_slice(&mut out, &subpaths, &subpath_lengths, 0.0, e_abs);
     }
     out
+}
+
+/// Walk `subpaths` with a running cumulative-length counter and
+/// emit the portion that falls in `[s_abs, e_abs]` (absolute arc
+/// lengths from the first subpath's start). Subpath boundaries
+/// within the window translate into `MoveTo` / `LineTo` command
+/// pairs; a slice that spans multiple subpaths starts a fresh
+/// subpath at each boundary so the output polyline doesn't
+/// connect disjoint subpaths with a phantom line.
+fn emit_absolute_slice(
+    out: &mut Path,
+    subpaths: &[Vec<Point>],
+    lengths: &[f32],
+    s_abs: f32,
+    e_abs: f32,
+) {
+    if e_abs <= s_abs {
+        return;
+    }
+    let mut cumulative = 0.0_f32;
+    for (subpath, &subpath_len) in subpaths.iter().zip(lengths.iter()) {
+        let sub_start = cumulative;
+        let sub_end = cumulative + subpath_len;
+        cumulative = sub_end;
+        if subpath_len < 1e-6 || sub_end < s_abs || sub_start > e_abs {
+            continue;
+        }
+        // Local slice range inside this subpath's arc-length frame.
+        let local_s = (s_abs - sub_start).max(0.0);
+        let local_e = (e_abs - sub_start).min(subpath_len);
+        emit_trimmed_subpath(
+            out,
+            subpath,
+            TrimWindow {
+                start: local_s / subpath_len,
+                end: local_e / subpath_len,
+            },
+        );
+    }
 }
 
 /// Flatten a path into separate polylines, one per subpath. A new
@@ -1687,6 +1778,63 @@ mod tests {
             .filter(|c| matches!(c, PathCommand::MoveTo(_)))
             .count();
         assert_eq!(move_tos, 2, "wrap should emit two subpaths");
+    }
+
+    #[test]
+    fn apply_trim_shares_arc_length_across_subpaths() {
+        // Two subpaths of different lengths: 4 units + 8 units
+        // (total 12). Trim [0, 0.5] expects the first 6 units,
+        // which covers the whole first subpath (4) plus 2 units
+        // into the second. Confirms the arc length is shared —
+        // the earlier per-subpath implementation would have trimmed
+        // each to 0.5 * its own length (2 + 4 = 6 as well, but
+        // split as two halves; this test exercises the shared
+        // behaviour explicitly).
+        let path = Path::new()
+            .move_to(0.0, 0.0)
+            .line_to(4.0, 0.0)
+            .move_to(0.0, 1.0)
+            .line_to(8.0, 1.0);
+        let window = TrimWindow { start: 0.0, end: 0.5 };
+        let trimmed = apply_trim(&path, window);
+        // Expect two subpaths in output: one for the full first
+        // subpath (4 units) and one for the partial second
+        // (2 units). Two `MoveTo` commands.
+        let move_tos = trimmed
+            .commands()
+            .iter()
+            .filter(|c| matches!(c, PathCommand::MoveTo(_)))
+            .count();
+        assert_eq!(move_tos, 2, "shared arc length should span both subpaths");
+
+        // Last emitted line_to should be at x=2 of the second
+        // subpath (its own frame starts at x=0, so the cut at
+        // 6 - 4 = 2 units in yields point (2, 1)).
+        let last = trimmed.commands().last().unwrap();
+        match last {
+            PathCommand::LineTo(p) => {
+                assert!((p.x - 2.0).abs() < 0.01, "end x ≈ 2, got {}", p.x);
+            }
+            other => panic!("expected LineTo at end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_trim_individual_per_subpath_matches_old_behavior() {
+        // Sanity check: when the caller wraps a single subpath in a
+        // single Path (the `Individual` mode's per-geometry call
+        // pattern), arc length is the subpath's own — matches
+        // pre-refactor semantics.
+        let path = Path::new()
+            .move_to(0.0, 0.0)
+            .line_to(10.0, 0.0);
+        let trimmed = apply_trim(&path, TrimWindow { start: 0.0, end: 0.5 });
+        let last = trimmed.commands().last().unwrap();
+        if let PathCommand::LineTo(p) = last {
+            assert!((p.x - 5.0).abs() < 0.01, "single-subpath trim → half length, got {}", p.x);
+        } else {
+            panic!("expected LineTo");
+        }
     }
 
     #[test]

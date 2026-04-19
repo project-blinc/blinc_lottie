@@ -65,16 +65,24 @@ it.
   cubic smoothness of the original but is imperceptible at the
   default 24-sample density.
 
-- [ ] **Trim paths — true Simultaneously (`m: 1`) + cubic output**
-  - **Why:** Multi-path groups with `m: 1` currently render with
-    per-geometry trim windows instead of the concatenation author
-    expected. Visual difference is clear only when the paths have
-    different arc lengths.
-  - **How:** Concatenate all group polylines into a single buffer,
-    compute one cumulative arc length, then emit slices. For cubic
-    output rather than polyline: track which original segments a
-    flattened sample came from and emit partial cubic beziers via
-    de Casteljau subdivision.
+- [x] **Trim paths — true Simultaneously (`m: 1`)** — shipped.
+  `apply_trim` now computes a single cumulative arc length across
+  every subpath of the input `Path` and maps the `[start, end]`
+  window to absolute lengths. `ShapeGroup` concatenates all its
+  geometry commands into one `Path` when `m: 1` is set before
+  calling `apply_trim`, so the trim spans the combined arc length
+  of all paths (matches AE's Simultaneously option). `m: 2` still
+  runs per-geometry for visual-independence when each geometry
+  has its own fill / stroke.
+
+- [ ] **Trim paths — cubic output**
+  - **Why:** Current output is a polyline (24 samples per cubic
+    curve). Smooth curves render slightly faceted at extreme
+    zoom. Fine at typical display scales; visible on 4K assets
+    that use heavy trim animation.
+  - **How:** Track which source cubic a flattened sample came
+    from. For sliced segments, use de Casteljau subdivision to
+    extract the cubic sub-curve matching the slice window.
 
 ---
 
@@ -214,7 +222,7 @@ it.
   command coordinates. Matte source layers skip their own
   render — their alpha is consumed by the pair.
 
-- [ ] **Track mattes — true offscreen composite**
+- [ ] **Track mattes — true offscreen composite** (blocked on GPU infra)
   - **Why:** The current shape-clip shortcut only honours
     Alpha mode correctly. `AlphaInverted` / `Luma` / `LumaInverted`
     collapse to Alpha because a `ClipShape::Path` can't represent
@@ -222,8 +230,12 @@ it.
   - **How:** Push a layer group with the matte source rendered into
     an offscreen texture, use it as a `LayerEffect::MaskImage`
     against the matted layer's offscreen texture, composite both.
-    Non-trivial — deferred until a real asset exercises non-Alpha
-    mattes.
+  - **Blocker:** `LayerCommand::Sample` is a no-op in the current
+    blinc_gpu renderer, and `LayerEffect::MaskImage` takes a URL
+    rather than a runtime texture ID. Implementing would need
+    cross-layer texture sampling + dynamic mask-image binding in
+    blinc_gpu — not doable from inside blinc_lottie. Park until
+    the upstream infrastructure lands or a real asset forces it.
 
 ---
 
