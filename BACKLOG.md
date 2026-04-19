@@ -147,13 +147,32 @@ it.
   - Right-to-left justification modes (`j: 3` / `4`) collapse to
     Left.
 
-- [ ] **Image layers (`ty: 2`)**
-  - **Why:** Hybrid vector/raster compositions.
-  - **How:** Requires `blinc_image`. Asset references live in
-    `assets` array at root; layer's `refId` points to one. Support
-    base64-inline assets first (`u: ""`, `p: "data:..."`), external
-    file references (`u: "images/", p: "img_0.png"`) after (needs a
-    file-loader trait the caller can implement).
+- [x] **Image layers (`ty: 2`)** — shipped.
+  `LayerKind::Image(Arc<ImageSpec>)` pulls from a pre-decoded
+  asset table assembled at load time. `decode_image_assets`
+  handles base64 data URIs directly via `blinc_image::ImageData`,
+  and consults an archive callback for external references —
+  `.lottie` archives surface `i/<filename>` entries keyed by
+  filename through `DotLottieArchive.images`, which
+  `from_dotlottie_bytes` threads into the decode pass. Plain-JSON
+  callers that want external-file loading can patch
+  `from_root_with_images` with a real file-backed callback.
+  Gated behind the `images` feature (on by default) so
+  vector-only consumers shed the image-decoding deps with
+  `default-features = false`. Render uploads via
+  `DrawContext::draw_rgba_pixels` per frame — a proper texture
+  cache so the upload happens once is tracked as perf follow-up.
+
+- [ ] **Image layer texture cache**
+  - **Why:** Current render path uploads the decoded RGBA bytes
+    every frame — fine for small icons, wasteful for 1080p
+    raster assets that recur across many frames.
+  - **How:** Register decoded bytes with a shared GPU cache keyed
+    by asset id, keep an `ImageId` on the `ImageSpec`, call
+    `DrawContext::draw_image(ImageId, ...)` instead of the raw
+    `draw_rgba_pixels`. Needs a registry that outlives a single
+    `LottiePlayer` instance — either a caller-provided handle or
+    a process-wide cache.
 
 - [x] **Null layer (`ty: 3`)** — shipped. `LayerKind::Null`
   renders nothing and keeps `ind` / `transform` so children can

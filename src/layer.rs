@@ -295,10 +295,30 @@ pub(crate) enum LayerKind {
     /// the glyph pipeline reuse shares atlases with layout-level
     /// text.
     Text(TextSpec),
-    /// Layer types not yet implemented (image, …).
-    /// Render as a no-op so the rest of the scene still composites
-    /// correctly.
+    /// Image (`ty: 2`). Decoded pixel data keyed to an entry in the
+    /// root `assets` table via `refId`. Only available under the
+    /// `images` feature — callers that disable it treat `ty: 2`
+    /// as [`LayerKind::Unknown`]. Renders by uploading the RGBA
+    /// bytes to a GPU texture each frame (through
+    /// `DrawContext::draw_rgba_pixels`); a texture cache so the
+    /// upload happens once is tracked as a perf follow-up.
+    #[cfg(feature = "images")]
+    Image(std::sync::Arc<ImageSpec>),
+    /// Unknown layer kind — render as a no-op so the rest of the
+    /// scene still composites correctly.
     Unknown,
+}
+
+/// Parsed Lottie image-asset payload resolved at load time.
+/// `rgba` holds already-decoded pixels so per-frame render does a
+/// pure upload + draw without touching an image decoder.
+#[cfg(feature = "images")]
+#[derive(Debug, Clone)]
+pub(crate) struct ImageSpec {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` bytes, row-major, non-premultiplied.
+    pub rgba: Vec<u8>,
 }
 
 /// Parsed Lottie text-document payload. Covers the subset that
@@ -734,6 +754,14 @@ pub(crate) struct AssetContext<'a> {
     /// which would recurse if the context held fully resolved
     /// trees upfront.
     pub precomp_layers: std::collections::HashMap<String, &'a [Value]>,
+    /// Map from image asset `id` to an already-decoded RGBA image.
+    /// Decoding happens at the player's load path so per-frame
+    /// render stays decode-free. Image assets without a
+    /// resolvable payload (missing `p` / `u`, decode error) drop
+    /// from the map — `ty: 2` layers referencing them fall back
+    /// to `Unknown`.
+    #[cfg(feature = "images")]
+    pub image_assets: std::collections::HashMap<String, std::sync::Arc<ImageSpec>>,
     /// Depth of the current precomp resolution — incremented
     /// before each recursion, compared against [`MAX_PRECOMP_DEPTH`]
     /// to bail out of authored cycles.
@@ -773,6 +801,8 @@ impl Layer {
         let kind = match ty {
             0 => parse_precomp(v, fr, ctx),
             1 => parse_solid(v),
+            #[cfg(feature = "images")]
+            2 => parse_image_layer(v, ctx),
             3 => LayerKind::Null,
             4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
             5 => parse_text(v).map_or(LayerKind::Unknown, LayerKind::Text),
@@ -875,6 +905,13 @@ impl Layer {
                 let w = spec.size * 0.8 * chars;
                 Some(Rect::new(0.0, -spec.size, w, h))
             }
+            #[cfg(feature = "images")]
+            LayerKind::Image(spec) => Some(Rect::new(
+                0.0,
+                0.0,
+                spec.width as f32,
+                spec.height as f32,
+            )),
             LayerKind::Precomp { width, height, .. } => {
                 // Precomps clip to their authored canvas size, so
                 // that rect is a tight cull bound regardless of
@@ -976,6 +1013,20 @@ impl Layer {
             }
             LayerKind::Text(spec) => {
                 render_text_layer(dc, spec);
+            }
+            #[cfg(feature = "images")]
+            LayerKind::Image(spec) => {
+                // Upload pixels + draw at the image's native size.
+                // Parent + layer transform are already on the
+                // stack, so a `Rect::new(0, 0, w, h)` dest lands
+                // at the author-intended position after the
+                // usual source-to-dest mapping.
+                dc.draw_rgba_pixels(
+                    &spec.rgba,
+                    spec.width,
+                    spec.height,
+                    Rect::new(0.0, 0.0, spec.width as f32, spec.height as f32),
+                );
             }
             LayerKind::Precomp {
                 layers,
@@ -1093,6 +1144,8 @@ fn parse_precomp(v: &Value, fr: f32, ctx: Option<&AssetContext<'_>>) -> LayerKin
     // Recurse with an incremented depth so cycles terminate.
     let inner_ctx = AssetContext {
         precomp_layers: ctx.precomp_layers.clone(),
+        #[cfg(feature = "images")]
+        image_assets: ctx.image_assets.clone(),
         depth: ctx.depth + 1,
     };
     let mut child_layers: Vec<Layer> = child_raw
@@ -1187,6 +1240,100 @@ fn parse_text(v: &Value) -> Option<TextSpec> {
         tracking,
         line_height,
     })
+}
+
+/// Resolve a `ty: 2` image layer against the pre-decoded image
+/// assets in `ctx`. `refId` matches an `assets[].id` entry;
+/// assets that didn't decode (external reference, unsupported
+/// format) produce `LayerKind::Unknown`. Keeps a cheap
+/// `Arc<ImageSpec>` clone so the caller doesn't re-allocate
+/// pixel data per layer.
+#[cfg(feature = "images")]
+fn parse_image_layer(v: &Value, ctx: Option<&AssetContext<'_>>) -> LayerKind {
+    let Some(ctx) = ctx else {
+        return LayerKind::Unknown;
+    };
+    let Some(ref_id) = v.get("refId").and_then(Value::as_str) else {
+        return LayerKind::Unknown;
+    };
+    match ctx.image_assets.get(ref_id) {
+        Some(spec) => LayerKind::Image(spec.clone()),
+        None => LayerKind::Unknown,
+    }
+}
+
+/// Decode every image asset in the root `assets` array into
+/// shareable `ImageSpec`s, skipping non-image entries (those carry
+/// a `layers` array for precomps and are handled separately).
+/// Handles both base64-embedded data URIs (`e: 1`, `p: "data:..."`)
+/// and `.lottie`-archive-provided pre-decoded bytes via the
+/// `archive_image` callback. Entries that fail to decode drop
+/// from the returned map so image-layer resolution returns
+/// `Unknown` for them.
+///
+/// External-file references (`u: "images/", p: "img_0.png"` in a
+/// plain JSON) currently drop too; a file-loader trait that the
+/// caller can implement is tracked as a follow-up.
+#[cfg(feature = "images")]
+pub(crate) fn decode_image_assets<F>(
+    assets: &[Value],
+    mut archive_image: F,
+) -> std::collections::HashMap<String, std::sync::Arc<ImageSpec>>
+where
+    F: FnMut(&str, &str) -> Option<Vec<u8>>,
+{
+    use std::sync::Arc;
+    let mut out = std::collections::HashMap::new();
+    for asset in assets {
+        let Some(id) = asset.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        // Precomp entries carry a `layers` array — they're handled
+        // by the precomp-resolution path, not here.
+        if asset.get("layers").is_some() {
+            continue;
+        }
+        let p = asset.get("p").and_then(Value::as_str).unwrap_or("");
+        let u = asset.get("u").and_then(Value::as_str).unwrap_or("");
+        let embedded = asset.get("e").and_then(Value::as_u64) == Some(1);
+
+        // Try data-URI first — cheapest path, no loader needed.
+        let bytes: Option<Vec<u8>> = if embedded && p.starts_with("data:") {
+            match blinc_image::ImageData::from_base64(p) {
+                Ok(img) => {
+                    out.insert(
+                        id.to_string(),
+                        Arc::new(ImageSpec {
+                            width: img.width(),
+                            height: img.height(),
+                            rgba: img.into_pixels(),
+                        }),
+                    );
+                    continue;
+                }
+                Err(_) => None,
+            }
+        } else {
+            // External reference — look up via the archive
+            // callback. Returns raw PNG / JPEG bytes that we then
+            // decode.
+            archive_image(u, p)
+        };
+
+        if let Some(raw) = bytes {
+            if let Ok(img) = blinc_image::ImageData::from_bytes(&raw) {
+                out.insert(
+                    id.to_string(),
+                    Arc::new(ImageSpec {
+                        width: img.width(),
+                        height: img.height(),
+                        rgba: img.into_pixels(),
+                    }),
+                );
+            }
+        }
+    }
+    out
 }
 
 fn parse_solid(v: &Value) -> LayerKind {
@@ -2085,6 +2232,105 @@ mod tests {
         assert!(Layer::from_value(&unknown, 60.0).source_bounds(0.0).is_none());
     }
 
+    #[cfg(feature = "images")]
+    #[test]
+    fn image_layer_resolves_from_asset_context() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        // 2×2 red RGBA image (no actual decode needed — we bypass
+        // `decode_image_assets` and seed the context directly).
+        let mut image_assets: HashMap<String, Arc<ImageSpec>> = HashMap::new();
+        image_assets.insert(
+            "img_0".to_string(),
+            Arc::new(ImageSpec {
+                width: 2,
+                height: 2,
+                rgba: vec![
+                    255, 0, 0, 255, 255, 0, 0, 255, // row 0
+                    255, 0, 0, 255, 255, 0, 0, 255, // row 1
+                ],
+            }),
+        );
+        let ctx = AssetContext {
+            precomp_layers: HashMap::new(),
+            image_assets,
+            depth: 0,
+        };
+        let v = json!({
+            "ty": 2, "refId": "img_0", "ip": 0, "op": 60,
+            "ks": {}
+        });
+        let layer = Layer::from_value_with_assets(&v, 60.0, Some(&ctx));
+        match &layer.kind {
+            LayerKind::Image(spec) => {
+                assert_eq!(spec.width, 2);
+                assert_eq!(spec.height, 2);
+                assert_eq!(spec.rgba.len(), 16);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn image_layer_without_context_falls_back_to_unknown() {
+        // Plain `from_value` can't resolve `refId`, so `ty: 2`
+        // layers render as no-ops — matches how precomp handles
+        // missing context.
+        let v = json!({ "ty": 2, "refId": "any", "ip": 0, "op": 60 });
+        let layer = Layer::from_value(&v, 60.0);
+        assert!(matches!(layer.kind, LayerKind::Unknown));
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn image_layer_missing_asset_id_falls_back_to_unknown() {
+        use std::collections::HashMap;
+        let ctx = AssetContext {
+            precomp_layers: HashMap::new(),
+            image_assets: HashMap::new(),
+            depth: 0,
+        };
+        let v = json!({ "ty": 2, "refId": "ghost", "ip": 0, "op": 60 });
+        let layer = Layer::from_value_with_assets(&v, 60.0, Some(&ctx));
+        assert!(matches!(layer.kind, LayerKind::Unknown));
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn decode_image_assets_handles_base64_data_uri() {
+        // A small inline PNG encoded as a data URI. Exact pixel
+        // values aren't locked in (different PNG encoders produce
+        // different payloads) — what matters is the decoder
+        // produces a 1×1 image with 4 bytes of RGBA.
+        let png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let assets = vec![json!({
+            "id": "pixel",
+            "w": 1, "h": 1,
+            "u": "",
+            "p": png_data_uri,
+            "e": 1,
+        })];
+        let decoded = decode_image_assets(&assets, |_, _| None);
+        let spec = decoded.get("pixel").expect("decoded asset");
+        assert_eq!(spec.width, 1);
+        assert_eq!(spec.height, 1);
+        assert_eq!(spec.rgba.len(), 4);
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn decode_image_assets_skips_precomp_entries() {
+        // Precomps are in the same array but have `layers` — they
+        // shouldn't try to decode.
+        let assets = vec![json!({
+            "id": "some_precomp",
+            "layers": [{ "ty": 1, "ip": 0, "op": 60 }]
+        })];
+        let decoded = decode_image_assets(&assets, |_, _| None);
+        assert!(decoded.is_empty());
+    }
+
     #[test]
     fn text_layer_parses_document_fields() {
         use blinc_core::TextAlign;
@@ -2264,6 +2510,8 @@ mod tests {
         ctx_layers.insert("child_comp".to_string(), child_layers.as_slice());
         let ctx = AssetContext {
             precomp_layers: ctx_layers,
+            #[cfg(feature = "images")]
+            image_assets: std::collections::HashMap::new(),
             depth: 0,
         };
 
@@ -2328,6 +2576,8 @@ mod tests {
         ctx_layers.insert("b".to_string(), b_layers.as_slice());
         let ctx = AssetContext {
             precomp_layers: ctx_layers,
+            #[cfg(feature = "images")]
+            image_assets: std::collections::HashMap::new(),
             depth: 0,
         };
         let outer = json!({

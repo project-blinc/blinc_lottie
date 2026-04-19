@@ -43,6 +43,12 @@ pub(crate) struct DotLottieArchive {
     pub animations: HashMap<String, Vec<u8>>,
     /// State-machine JSON bytes keyed by `id` (matches `s/<id>.json`).
     pub state_machines: HashMap<String, Vec<u8>>,
+    /// Image bytes (raw PNG / JPEG / WebP) keyed by archive filename
+    /// — e.g. `"img_0.png"` for an entry at `i/img_0.png`. Looked up
+    /// by the image-decode pass in lib.rs against the animation's
+    /// `assets[].p` filename so `ty: 2` layers referencing an
+    /// archive-bundled raster render at their authored size.
+    pub images: HashMap<String, Vec<u8>>,
 }
 
 impl DotLottieArchive {
@@ -181,10 +187,26 @@ pub(crate) fn extract(src: &[u8]) -> Result<DotLottieArchive, Error> {
         }
     }
 
+    // Surface every `i/<filename>` as an image entry keyed by
+    // filename (so the animation JSON's `assets[].p` field can
+    // look it up directly — manifests don't usually enumerate
+    // images, so walk the raw filesystem). Image content stays
+    // raw (PNG / JPEG / WebP bytes); decoding happens once at
+    // player load via `blinc_image`.
+    let mut images: HashMap<String, Vec<u8>> = HashMap::new();
+    for (name, bytes) in &files {
+        if let Some(filename) = name.strip_prefix("i/") {
+            if !filename.is_empty() && !filename.ends_with('/') {
+                images.insert(filename.to_string(), bytes.clone());
+            }
+        }
+    }
+
     Ok(DotLottieArchive {
         manifest,
         animations,
         state_machines,
+        images,
     })
 }
 
@@ -203,6 +225,7 @@ impl std::fmt::Debug for DotLottieArchive {
                 "state_machines",
                 &self.state_machines.keys().collect::<Vec<_>>(),
             )
+            .field("images", &self.images.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -295,6 +318,25 @@ mod tests {
             Err(Error::Archive(_)) => {}
             other => panic!("expected Archive error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn surfaces_images_from_archive_i_directory() {
+        // Images live in `i/` keyed by filename so the animation's
+        // `assets[].p` field can look them up verbatim.
+        let manifest = br#"{"version":"2","animations":[{"id":"main"}]}"#;
+        let raw_png: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\0"; // not a real PNG, just bytes
+        let raw_jpg: &[u8] = b"\xff\xd8\xff\xe0\0\0";
+        let archive = make_archive(&[
+            ("manifest.json", manifest),
+            ("a/main.json", minimal_anim()),
+            ("i/logo.png", raw_png),
+            ("i/hero.jpg", raw_jpg),
+        ]);
+        let decoded = extract(&archive).unwrap();
+        assert_eq!(decoded.images.len(), 2);
+        assert_eq!(decoded.images.get("logo.png"), Some(&raw_png.to_vec()));
+        assert_eq!(decoded.images.get("hero.jpg"), Some(&raw_jpg.to_vec()));
     }
 
     #[test]

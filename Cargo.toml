@@ -27,6 +27,11 @@ rust-version = "1.75"
 # crate functionality requires API additions upstream.
 blinc_canvas_kit = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b" }
 blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b" }
+# Image decoding for `ty: 2` image layers — handles base64 data
+# URIs embedded in `assets[].p` as well as raw PNG / JPEG bytes
+# extracted from the `.lottie` archive's `i/` directory. Optional
+# so assets that never use raster layers don't pay for the deps.
+blinc_image = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b", optional = true }
 
 # JSON parsing for Lottie's `.json` / `.lottie` (zipped JSON) format.
 serde = { version = "1.0", features = ["derive"] }
@@ -57,6 +62,7 @@ zip = { version = "2.2", default-features = false, features = ["deflate"], optio
 [patch."https://github.com/project-blinc/Blinc.git"]
 blinc_core = { path = "../../crates/blinc_core" }
 blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
+blinc_image = { path = "../../crates/blinc_image" }
 blinc_layout = { path = "../../crates/blinc_layout" }
 blinc_platform = { path = "../../crates/blinc_platform" }
 
@@ -69,5 +75,9 @@ blinc_input = { path = "../blinc_input" }
 # standardised around for distribution, and most real-world Lottie
 # assets ship as `.lottie` now. Callers bundling only raw JSON
 # scenes can opt out via `default-features = false`.
-default = ["dotlottie"]
+default = ["dotlottie", "images"]
 dotlottie = ["dep:zip"]
+# `ty: 2` image layer support. Pulls in `blinc_image` for PNG /
+# JPEG / base64 decoding. Callers that only load vector-only
+# Lotties can disable this to shed the image-decoding deps.
+images = ["dep:blinc_image"]

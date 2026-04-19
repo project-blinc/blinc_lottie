@@ -132,10 +132,32 @@ impl LottiePlayer {
         let animation_bytes = archive
             .initial_animation()
             .ok_or_else(|| Error::Archive("archive declares no animations".to_string()))?;
-        Self::from_bytes(animation_bytes)
+        let root: parser::LottieRoot = serde_json::from_slice(animation_bytes)?;
+        #[cfg(feature = "images")]
+        {
+            Ok(Self::from_root_with_images(root, Some(&archive.images)))
+        }
+        #[cfg(not(feature = "images"))]
+        Ok(Self::from_root_with_images(root, None))
     }
 
     fn from_root(root: parser::LottieRoot) -> Self {
+        Self::from_root_with_images(root, None)
+    }
+
+    /// Shared load path with an optional external image map. Plain
+    /// JSON loaders pass `None`; the `.lottie` archive path passes
+    /// `Some(&archive.images)`, keyed by `i/<filename>` so
+    /// `assets[].p` references resolve against the archived raster
+    /// bytes. Build path ignores `archive_images` when the `images`
+    /// feature is disabled.
+    fn from_root_with_images(
+        root: parser::LottieRoot,
+        #[cfg(feature = "images")] archive_images: Option<
+            &std::collections::HashMap<String, Vec<u8>>,
+        >,
+        #[cfg(not(feature = "images"))] _archive_images: Option<()>,
+    ) -> Self {
         let fr = root.frame_rate.max(1.0);
         let markers = root
             .markers
@@ -163,8 +185,21 @@ impl LottiePlayer {
             };
             precomp_layers.insert(id.to_string(), layers_arr.as_slice());
         }
+        // Image assets (`ty: 2` layer references) decode once here
+        // so render is decode-free. `decode_image_assets` handles
+        // base64 data URIs directly; external-file references
+        // consult the archive callback (plain JSON passes `None`;
+        // `.lottie` archives pass `i/<filename>` raw bytes keyed
+        // by filename).
+        #[cfg(feature = "images")]
+        let image_assets = layer::decode_image_assets(&root.assets, |_u, p| {
+            archive_images.and_then(|map| map.get(p).cloned())
+        });
+
         let asset_ctx = layer::AssetContext {
             precomp_layers,
+            #[cfg(feature = "images")]
+            image_assets,
             depth: 0,
         };
         let mut layers: Vec<Layer> = root
