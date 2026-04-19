@@ -171,13 +171,28 @@ it.
   own parent-chain transforms. `MAX_PRECOMP_DEPTH` (8) bounds
   authored cycles without paying a HashSet walk per layer.
 
-- [ ] **Track mattes (`tt`)**
-  - **Why:** Alpha / luma masking between adjacent layers.
-  - **How:** `tt` on layer N means the next layer N+1 serves as N's
-    matte. Needs an offscreen render pass — group affected layers into
-    a layer group rendered to an intermediate texture, then composite
-    with the matte's alpha. Non-trivial; park until real files demand
-    it.
+- [x] **Track mattes (`tt`)** — shipped, shape-clip
+  approximation. `Layer.track_matte` parses the four `tt` modes
+  (Alpha / AlphaInverted / Luma / LumaInverted) and `is_matte_source`
+  reads from either the JSON `td` flag or the implicit "layer
+  after a `tt`-bearing one" convention via `resolve_matte_pairs`.
+  At render the matted layer pushes the matte source's union
+  shape (composed from every geometry path in every group,
+  recursed into nested children) as a `ClipShape::Path`, with
+  the matte's parent-chain + own transform baked into the
+  command coordinates. Matte source layers skip their own
+  render — their alpha is consumed by the pair.
+
+- [ ] **Track mattes — true offscreen composite**
+  - **Why:** The current shape-clip shortcut only honours
+    Alpha mode correctly. `AlphaInverted` / `Luma` / `LumaInverted`
+    collapse to Alpha because a `ClipShape::Path` can't represent
+    the matte's actual luminance gradient or inversion.
+  - **How:** Push a layer group with the matte source rendered into
+    an offscreen texture, use it as a `LayerEffect::MaskImage`
+    against the matted layer's offscreen texture, composite both.
+    Non-trivial — deferred until a real asset exercises non-Alpha
+    mattes.
 
 ---
 

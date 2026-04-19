@@ -176,8 +176,12 @@ impl LottiePlayer {
         // `Vec<Layer>`, so resolution has to run after all
         // entries are constructed. Keep this next to `from_value`
         // calls so a future contributor can't forget to re-run it
-        // after parse-time mutations.
+        // after parse-time mutations. Matte pairing runs next so
+        // `is_matte_source` is set both from the direct `td` flag
+        // and from the implicit "layer after a `tt`-bearing one"
+        // convention.
         layer::resolve_parent_chains(&mut layers);
+        layer::resolve_matte_pairs(&mut layers);
         Self {
             root,
             layers,
@@ -329,22 +333,7 @@ impl LottiePlayer {
         let dc: &mut dyn DrawContext = ctx.draw_context();
         dc.push_transform(Transform::translate(rect.x(), rect.y()));
         dc.push_transform(Transform::scale(sx, sy));
-        for (i, layer) in self.layers.iter().enumerate().rev() {
-            for &anc_idx in &layer.parent_chain {
-                let anc_xform = self.layers[anc_idx].transform.sample(scene_t);
-                layer::push_parent_transform(dc, &anc_xform);
-            }
-            if cull_layer(&self.layers, i, dc, rect, scene_t) {
-                for _ in 0..layer.parent_chain.len() {
-                    layer::pop_parent_transform(dc);
-                }
-                continue;
-            }
-            layer.render(dc, scene_t);
-            for _ in 0..layer.parent_chain.len() {
-                layer::pop_parent_transform(dc);
-            }
-        }
+        render_layer_stack(dc, &self.layers, rect, scene_t);
         dc.pop_transform();
         dc.pop_transform();
     }
@@ -419,22 +408,7 @@ impl Player for LottiePlayer {
         // render. Parent-chain push/pop still happens for culled
         // layers — it's cheap compared to `push_layer`'s
         // offscreen setup for shadow / blur effects.
-        for (i, layer) in self.layers.iter().enumerate().rev() {
-            for &anc_idx in &layer.parent_chain {
-                let anc_xform = self.layers[anc_idx].transform.sample(scene_t);
-                layer::push_parent_transform(dc, &anc_xform);
-            }
-            if cull_layer(&self.layers, i, dc, rect, scene_t) {
-                for _ in 0..layer.parent_chain.len() {
-                    layer::pop_parent_transform(dc);
-                }
-                continue;
-            }
-            layer.render(dc, scene_t);
-            for _ in 0..layer.parent_chain.len() {
-                layer::pop_parent_transform(dc);
-            }
-        }
+        render_layer_stack(dc, &self.layers, rect, scene_t);
 
         dc.pop_transform();
         dc.pop_transform();
@@ -463,6 +437,150 @@ impl Player for LottiePlayer {
         } else {
             Some(self.last_scene_t)
         };
+    }
+}
+
+/// Shared render walker used by both `Player::draw_at` and
+/// `LottiePlayer::draw_frame`. Iterates back-to-front, honours
+/// parent chains, off-screen culling, and track mattes. The
+/// caller has already pushed the root source-to-dest transform
+/// so primitives emitted here land at the right screen position.
+fn render_layer_stack(
+    dc: &mut dyn blinc_core::DrawContext,
+    layers: &[Layer],
+    dest: Rect,
+    scene_t: f32,
+) {
+    for (i, layer) in layers.iter().enumerate().rev() {
+        // Matte sources never render on their own — only their
+        // shape is consumed (as a clip) by the preceding matted
+        // layer. Skip entirely.
+        if layer.is_matte_source {
+            continue;
+        }
+
+        for &anc_idx in &layer.parent_chain {
+            let anc_xform = layers[anc_idx].transform.sample(scene_t);
+            layer::push_parent_transform(dc, &anc_xform);
+        }
+
+        // If this layer nominates a matte source, extract its
+        // clip path (transformed through the matte source's own
+        // world-space affine), push it as a `ClipShape::Path`,
+        // then pop after the matted render. The current pragmatic
+        // implementation collapses Alpha / AlphaInverted / Luma /
+        // LumaInverted to Alpha — the matte's silhouette clips the
+        // matted content. Inverted / Luma modes require offscreen
+        // composite to honour faithfully; tracked as follow-up.
+        let matte_pushed = push_matte_clip(dc, layers, i, scene_t);
+
+        if cull_layer(layers, i, dc, dest, scene_t) {
+            if matte_pushed {
+                dc.pop_clip();
+            }
+            for _ in 0..layer.parent_chain.len() {
+                layer::pop_parent_transform(dc);
+            }
+            continue;
+        }
+
+        layer.render(dc, scene_t);
+
+        if matte_pushed {
+            dc.pop_clip();
+        }
+        for _ in 0..layer.parent_chain.len() {
+            layer::pop_parent_transform(dc);
+        }
+    }
+}
+
+/// When `layers[i]` has an active track matte, push the matte
+/// source's clip path onto `dc` and return `true` so the caller
+/// can match the pop. The path is pre-transformed through the
+/// matte source's parent chain + own transform so the clip lands
+/// in source space (the same space the matted layer's own paint
+/// uses after its transforms are pushed).
+fn push_matte_clip(
+    dc: &mut dyn blinc_core::DrawContext,
+    layers: &[Layer],
+    matted_idx: usize,
+    scene_t: f32,
+) -> bool {
+    use blinc_core::layer::{Affine2D, ClipShape};
+    let matted = &layers[matted_idx];
+    if !matted.track_matte.is_active() {
+        return false;
+    }
+    let Some(matte) = layers.get(matted_idx + 1) else {
+        return false;
+    };
+    let Some(local_path) = matte.extract_matte_path(scene_t) else {
+        return false;
+    };
+
+    // Compose matte source's world affine: parent chain × own
+    // transform. The matted layer's own transform is applied
+    // separately inside `layer.render`, so we only need the
+    // matte's transforms here.
+    let mut world: Affine2D = Affine2D::IDENTITY;
+    for &anc_idx in &matte.parent_chain {
+        let anc_xform = layers[anc_idx].transform.sample(scene_t);
+        world = layer::multiply_affines(&world, &layer::layer_local_affine(&anc_xform));
+    }
+    let matte_xform = matte.transform.sample(scene_t);
+    world = layer::multiply_affines(&world, &layer::layer_local_affine(&matte_xform));
+
+    // Transform every path command through the composed affine.
+    let commands: Vec<_> = local_path
+        .commands()
+        .iter()
+        .map(|cmd| transform_matte_command(cmd, &world))
+        .collect();
+    let transformed = blinc_core::draw::Path::from_commands(commands);
+
+    dc.push_clip(ClipShape::Path(transformed));
+    true
+}
+
+fn transform_matte_command(
+    cmd: &blinc_core::draw::PathCommand,
+    affine: &blinc_core::layer::Affine2D,
+) -> blinc_core::draw::PathCommand {
+    use blinc_core::draw::PathCommand;
+    use blinc_core::layer::Point;
+    let [a, b, c, d, tx, ty] = affine.elements;
+    let apply = |p: Point| Point::new(a * p.x + c * p.y + tx, b * p.x + d * p.y + ty);
+    match cmd {
+        PathCommand::MoveTo(p) => PathCommand::MoveTo(apply(*p)),
+        PathCommand::LineTo(p) => PathCommand::LineTo(apply(*p)),
+        PathCommand::QuadTo { control, end } => PathCommand::QuadTo {
+            control: apply(*control),
+            end: apply(*end),
+        },
+        PathCommand::CubicTo {
+            control1,
+            control2,
+            end,
+        } => PathCommand::CubicTo {
+            control1: apply(*control1),
+            control2: apply(*control2),
+            end: apply(*end),
+        },
+        PathCommand::ArcTo {
+            radii,
+            rotation,
+            large_arc,
+            sweep,
+            end,
+        } => PathCommand::ArcTo {
+            radii: *radii,
+            rotation: *rotation,
+            large_arc: *large_arc,
+            sweep: *sweep,
+            end: apply(*end),
+        },
+        PathCommand::Close => PathCommand::Close,
     }
 }
 

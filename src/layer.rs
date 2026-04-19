@@ -67,6 +67,56 @@ pub(crate) struct Layer {
     /// are still in source-space units because the layer's own
     /// transform is applied *inside* that push.
     pub effects: Vec<EffectSpec>,
+    /// Track matte type parsed from the `tt` field.
+    /// `None` (or `TrackMatteType::None`) means this layer renders
+    /// normally. Any other value means the NEXT layer in the array
+    /// (index + 1) acts as this layer's matte source — its alpha
+    /// clips this layer's paint. The matte source itself is
+    /// suppressed by [`Self::is_matte_source`].
+    pub track_matte: TrackMatteType,
+    /// `true` when this layer is consumed as a matte by the
+    /// previous layer (derived from `td` on the JSON, or implied
+    /// by the previous layer's `tt` + resolution pass). Such
+    /// layers are skipped during render — only their shape is
+    /// used as a clip for the preceding (matted) layer.
+    pub is_matte_source: bool,
+}
+
+/// Track matte mode parsed from Lottie's `tt` field. Per spec:
+/// - `0` / absent — no matte
+/// - `1` — Alpha
+/// - `2` — Alpha Inverted
+/// - `3` — Luma
+/// - `4` — Luma Inverted
+///
+/// Current implementation treats all modes as a best-effort Alpha
+/// clip — the matte source's shape becomes a `ClipShape::Path` on
+/// the matted layer. Luma / inverted modes render the same as
+/// Alpha until offscreen composite lands (tracked as "true
+/// offscreen track mattes" follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackMatteType {
+    None,
+    Alpha,
+    AlphaInverted,
+    Luma,
+    LumaInverted,
+}
+
+impl TrackMatteType {
+    fn from_u64(n: u64) -> Self {
+        match n {
+            1 => Self::Alpha,
+            2 => Self::AlphaInverted,
+            3 => Self::Luma,
+            4 => Self::LumaInverted,
+            _ => Self::None,
+        }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// Parsed Lottie layer effect. Currently restricted to the two
@@ -703,6 +753,21 @@ impl Layer {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(|e| parse_effect(e, fr)).collect())
             .unwrap_or_default();
+        // Spec: `tt` on a layer nominates the next layer in the
+        // array as its matte source. `td` on a layer marks it as
+        // the matte source for the PREVIOUS layer. Both are parsed
+        // here so the resolution pass can cross-check; when only
+        // one of the two is set we still honour the matte pairing.
+        let track_matte = v
+            .get("tt")
+            .and_then(Value::as_u64)
+            .map(TrackMatteType::from_u64)
+            .unwrap_or(TrackMatteType::None);
+        let is_matte_source = v
+            .get("td")
+            .and_then(Value::as_u64)
+            .map(|n| n != 0)
+            .unwrap_or(false);
         Self {
             kind,
             in_seconds: in_frames / fr,
@@ -713,6 +778,31 @@ impl Layer {
             parent_ind,
             parent_chain: Vec::new(),
             effects,
+            track_matte,
+            is_matte_source,
+        }
+    }
+
+    /// Produce a Path approximating this layer's alpha coverage,
+    /// suitable for use as a `ClipShape::Path` on an adjacent
+    /// matted layer. Only Shape layers carry enough path
+    /// information to extract cheaply — Solid / Null / Precomp /
+    /// Unknown fall back to the layer's axis-aligned source
+    /// bounds (rect approximation) or `None` when even that's
+    /// unavailable. Output is in the matte source's own pre-
+    /// transform frame; the render caller composes the source
+    /// layer's transform separately.
+    pub(crate) fn extract_matte_path(&self, scene_t: f32) -> Option<blinc_core::draw::Path> {
+        use blinc_core::draw::Path;
+        match &self.kind {
+            LayerKind::Shape(content) => content.extract_union_path(scene_t),
+            LayerKind::Solid { width, height, .. } => {
+                Some(Path::rect(Rect::new(0.0, 0.0, *width, *height)))
+            }
+            LayerKind::Precomp { width, height, .. } if *width > 0.0 && *height > 0.0 => {
+                Some(Path::rect(Rect::new(0.0, 0.0, *width, *height)))
+            }
+            _ => None,
         }
     }
 
@@ -957,10 +1047,12 @@ fn parse_precomp(v: &Value, fr: f32, ctx: Option<&AssetContext<'_>>) -> LayerKin
         .iter()
         .map(|layer_v| Layer::from_value_with_assets(layer_v, fr, Some(&inner_ctx)))
         .collect();
-    // Recursively resolve parent chains inside the precomp. Each
-    // precomp has its own `ind` namespace so this walk is scoped to
-    // the child layers, not the outer composition.
+    // Recursively resolve parent chains + matte pairs inside the
+    // precomp. Each precomp has its own `ind` namespace so this
+    // walk is scoped to the child layers, not the outer
+    // composition.
     resolve_parent_chains(&mut child_layers);
+    resolve_matte_pairs(&mut child_layers);
 
     let width = v.get("w").and_then(Value::as_f64).unwrap_or(0.0) as f32;
     let height = v.get("h").and_then(Value::as_f64).unwrap_or(0.0) as f32;
@@ -1414,6 +1506,31 @@ pub(crate) fn transformed_aabb_intersects(
 /// layer ends up with an empty chain so the composition still
 /// renders (the bad layer just ignores its missing parent).
 /// Output is outermost-ancestor-first so callers can push in order.
+/// Mark matte-source layers based on the preceding layer's `tt`
+/// field. Lottie convention: a layer with `tt > 0` at index N
+/// takes layer N+1 as its matte source. We already set
+/// `is_matte_source` directly when the JSON's `td` field was
+/// present, but many exports omit `td` and rely on position alone —
+/// this pass ensures the pairing works either way.
+///
+/// Also clears `track_matte` when the nominated matte source
+/// doesn't exist (last layer with `tt` set), so the render path
+/// doesn't hunt for a nonexistent clip.
+pub(crate) fn resolve_matte_pairs(layers: &mut [Layer]) {
+    let n = layers.len();
+    for i in 0..n {
+        if layers[i].track_matte.is_active() {
+            if i + 1 < n {
+                layers[i + 1].is_matte_source = true;
+            } else {
+                // Dangling `tt` — drop it so downstream render
+                // doesn't look for an absent matte layer.
+                layers[i].track_matte = TrackMatteType::None;
+            }
+        }
+    }
+}
+
 pub(crate) fn resolve_parent_chains(layers: &mut [Layer]) {
     use std::collections::HashMap;
     let mut ind_to_index: HashMap<i32, usize> = HashMap::new();
@@ -1809,6 +1926,80 @@ mod tests {
         let unknown = json!({ "ty": 99, "ip": 0, "op": 60 });
         assert!(Layer::from_value(&null, 60.0).source_bounds(0.0).is_none());
         assert!(Layer::from_value(&unknown, 60.0).source_bounds(0.0).is_none());
+    }
+
+    #[test]
+    fn track_matte_tt_pairs_next_layer_as_source() {
+        // Two-layer pair: matted (tt=1) + matte source (next in
+        // array). After resolution the second layer should be
+        // flagged as a matte source.
+        let matted = json!({ "ty": 1, "ind": 1, "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ff0000", "tt": 1 });
+        let matte = json!({ "ty": 1, "ind": 2, "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff" });
+        let mut layers = vec![
+            Layer::from_value(&matted, 60.0),
+            Layer::from_value(&matte, 60.0),
+        ];
+        resolve_matte_pairs(&mut layers);
+        assert_eq!(layers[0].track_matte, TrackMatteType::Alpha);
+        assert!(!layers[0].is_matte_source);
+        assert!(layers[1].is_matte_source);
+    }
+
+    #[test]
+    fn track_matte_td_flag_marks_source_directly() {
+        // Some exports mark the matte source explicitly via `td`
+        // instead of (or in addition to) the preceding layer's
+        // `tt`. Either convention ends up with the same
+        // resolution.
+        let matte = json!({ "ty": 1, "ind": 1, "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff", "td": 1 });
+        let mut layers = vec![Layer::from_value(&matte, 60.0)];
+        resolve_matte_pairs(&mut layers);
+        assert!(layers[0].is_matte_source);
+    }
+
+    #[test]
+    fn dangling_tt_on_last_layer_clears_itself() {
+        // Last layer in the array has `tt` but no successor to act
+        // as matte source. Resolution must clear the `tt` so the
+        // render path doesn't index past the end looking for a
+        // nonexistent matte.
+        let orphan = json!({ "ty": 1, "ind": 1, "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#00ff00", "tt": 1 });
+        let mut layers = vec![Layer::from_value(&orphan, 60.0)];
+        resolve_matte_pairs(&mut layers);
+        assert_eq!(layers[0].track_matte, TrackMatteType::None);
+    }
+
+    #[test]
+    fn track_matte_types_parse_all_modes() {
+        let v = |tt: u32| -> Value {
+            json!({ "ty": 1, "ip": 0, "op": 60,
+                "sw": 10.0, "sh": 10.0, "sc": "#000000", "tt": tt })
+        };
+        assert_eq!(
+            Layer::from_value(&v(1), 60.0).track_matte,
+            TrackMatteType::Alpha
+        );
+        assert_eq!(
+            Layer::from_value(&v(2), 60.0).track_matte,
+            TrackMatteType::AlphaInverted
+        );
+        assert_eq!(
+            Layer::from_value(&v(3), 60.0).track_matte,
+            TrackMatteType::Luma
+        );
+        assert_eq!(
+            Layer::from_value(&v(4), 60.0).track_matte,
+            TrackMatteType::LumaInverted
+        );
+        // Unknown / 0 → None
+        assert_eq!(
+            Layer::from_value(&v(99), 60.0).track_matte,
+            TrackMatteType::None
+        );
     }
 
     #[test]

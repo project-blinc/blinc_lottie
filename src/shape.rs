@@ -415,6 +415,31 @@ impl ShapeContent {
         }
         out
     }
+
+    /// Union every paintable geometry from every group into a
+    /// single `Path`. Used by track mattes: the resulting path is
+    /// pushed as a `ClipShape::Path` on the matted layer so the
+    /// matte's alpha silhouette clips the matted content. Ignores
+    /// fills / strokes / trims — track mattes only care about the
+    /// shape's extent.
+    ///
+    /// For groups with multiple geometries, all of them contribute
+    /// to the union path in source-space order (each becomes its
+    /// own subpath). Nested `gr` children recurse through the same
+    /// accumulator so compound mattes work as long as the clip
+    /// implementation honours multi-subpath clips (it does — each
+    /// subpath intersects via even-odd fill).
+    pub(crate) fn extract_union_path(&self, t: f32) -> Option<Path> {
+        let mut commands: Vec<PathCommand> = Vec::new();
+        for group in &self.groups {
+            group.accumulate_clip_commands(&mut commands, t);
+        }
+        if commands.is_empty() {
+            None
+        } else {
+            Some(Path::from_commands(commands))
+        }
+    }
 }
 
 impl ShapeGroup {
@@ -481,6 +506,27 @@ impl ShapeGroup {
         }
     }
 
+    /// Append every geometry's path commands to `out`, transformed
+    /// through this group's own `tr` affine (if present) and
+    /// recursing into nested children. Used by track mattes — the
+    /// accumulated commands flatten the entire shape tree into a
+    /// single multi-subpath `Path` that the clip stack can honour.
+    fn accumulate_clip_commands(&self, out: &mut Vec<PathCommand>, t: f32) {
+        let affine = self.transform.as_ref().map(|ts| {
+            let xf = ts.sample(t);
+            crate::layer::layer_local_affine(&xf)
+        });
+        for geo in &self.geometries {
+            let path = geo.to_path(t);
+            for cmd in path.commands() {
+                out.push(transform_path_command(cmd, affine.as_ref()));
+            }
+        }
+        for child in &self.children {
+            child.accumulate_clip_commands(out, t);
+        }
+    }
+
     /// Union of every geometry and nested-group bound, propagated
     /// through this group's own `tr` transform if it has one.
     /// Geometry contributes its pre-trim bounds — computing the
@@ -514,6 +560,52 @@ fn merge_rects(existing: Option<Rect>, next: Rect) -> Rect {
     match existing {
         Some(prev) => prev.union(&next),
         None => next,
+    }
+}
+
+/// Transform every point in a `PathCommand` through `affine` if
+/// provided, otherwise return the command unchanged. Arc endpoint
+/// transforms work because Lottie exports arcs as cubic beziers
+/// almost exclusively; `ArcTo` still passes through correctly for
+/// the non-Lottie caller that might sit on top of this helper.
+fn transform_path_command(cmd: &PathCommand, affine: Option<&blinc_core::layer::Affine2D>) -> PathCommand {
+    let apply = |p: Point| match affine {
+        None => p,
+        Some(a) => {
+            let [m0, m1, m2, m3, tx, ty] = a.elements;
+            Point::new(m0 * p.x + m2 * p.y + tx, m1 * p.x + m3 * p.y + ty)
+        }
+    };
+    match cmd {
+        PathCommand::MoveTo(p) => PathCommand::MoveTo(apply(*p)),
+        PathCommand::LineTo(p) => PathCommand::LineTo(apply(*p)),
+        PathCommand::QuadTo { control, end } => PathCommand::QuadTo {
+            control: apply(*control),
+            end: apply(*end),
+        },
+        PathCommand::CubicTo {
+            control1,
+            control2,
+            end,
+        } => PathCommand::CubicTo {
+            control1: apply(*control1),
+            control2: apply(*control2),
+            end: apply(*end),
+        },
+        PathCommand::ArcTo {
+            radii,
+            rotation,
+            large_arc,
+            sweep,
+            end,
+        } => PathCommand::ArcTo {
+            radii: *radii,
+            rotation: *rotation,
+            large_arc: *large_arc,
+            sweep: *sweep,
+            end: apply(*end),
+        },
+        PathCommand::Close => PathCommand::Close,
     }
 }
 
