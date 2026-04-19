@@ -115,11 +115,20 @@ it.
   / Blur Dimensions / quality are parsed-and-ignored — every blur
   is both-axis with the default quality.
 
-- [ ] **Outer Glow effect**
-  - **Why:** Lottie's native "Glow" is an AE compound effect that
-    dotLottie doesn't standardise into a stable type number; some
-    authoring tools emit it as a Tritone + Gaussian Blur chain.
-    When the format settles, map to `LayerEffect::Glow`.
+- [x] **Outer Glow effect** — shipped via two detection signals.
+  Lottie doesn't ship a stable `ty` for Glow across exporters,
+  but `EffectSpec::Glow` now parses when either condition holds:
+  1. The effect's `nm` (author name) contains "glow"
+     (case-insensitive) — authoring tools like Lottie-Creator
+     label their glow preset this way.
+  2. A `ty: 25` (Drop Shadow) whose distance is statically zero
+     — the symmetric-halo idiom that some authoring tools
+     export through the Drop Shadow JSON shape.
+
+  Both signals reuse Drop Shadow's property layout (color,
+  opacity, softness); the render path maps into `LayerEffect::Glow`
+  with `blur = softness * 0.7`, `range = softness`. Drop Shadows
+  with a real offset stay as Drop Shadows.
 
 - [x] **Masks (`masksProperties`)** — shipped. `MaskSpec` carries
   mode (`add` / `subtract` / `intersect` / `lighten` / `darken` /

@@ -141,6 +141,29 @@ pub(crate) enum EffectSpec {
     /// "Blur Dimensions" (horizontal / vertical / both) parses but
     /// isn't applied — every blur is both-axis Gaussian.
     Blur { radius: AnimatedF32 },
+    /// Outer Glow. Lottie doesn't ship a stable `ty` for Glow
+    /// across exporters, so parsing recognises two signals:
+    /// 1. The effect's `nm` (author name) contains "glow"
+    ///    (case-insensitive) — authoring tools like
+    ///    Lottie-Creator label their glow preset this way.
+    /// 2. A `ty: 25` (Drop Shadow) whose distance keyframes to
+    ///    zero — the "zero-offset shadow" idiom that produces a
+    ///    symmetric halo instead of a directional drop.
+    ///
+    /// Properties reuse Drop Shadow's shape (color + opacity +
+    /// softness) since that's the input exporters emit. At render
+    /// `softness` drives both the glow's blur and its range —
+    /// users wanting independent knobs can override the defaults
+    /// here.
+    Glow {
+        color: AnimatedVec4,
+        opacity: AnimatedF32,
+        /// Softness from the Drop Shadow source, doubles as the
+        /// glow's blur + range. `LayerEffect::Glow` takes distinct
+        /// `blur` / `range` values; the render path derives both
+        /// from this single input.
+        softness: AnimatedF32,
+    },
 }
 
 impl EffectSpec {
@@ -173,7 +196,38 @@ impl EffectSpec {
                 }
             }
             EffectSpec::Blur { radius } => LayerEffect::blur(radius.sample(t).max(0.0)),
+            EffectSpec::Glow {
+                color,
+                opacity,
+                softness,
+            } => {
+                let c = color.sample(t);
+                let o = opacity.sample(t);
+                let s = softness.sample(t).max(0.0);
+                // Blur softens the glow's inner edge; range controls
+                // how far the halo extends. Using the same input
+                // for both produces a visually balanced glow — a
+                // Drop-Shadow-with-distance-zero that authoring
+                // tools emit maps cleanly onto this.
+                LayerEffect::Glow {
+                    color: Color::rgba(c[0], c[1], c[2], c[3] * o),
+                    blur: s * 0.7,
+                    range: s,
+                    opacity: o,
+                }
+            }
         }
+    }
+}
+
+/// `true` when an `AnimatedF32` is a static zero (no keyframes)
+/// or a keyframe track where every sample rests on 0. Used to
+/// recognise Drop-Shadow-with-zero-distance as a Glow preset at
+/// parse time.
+fn is_zero_scalar(track: &AnimatedF32) -> bool {
+    match track {
+        AnimatedF32::Static(v) => v.abs() < 1e-5,
+        AnimatedF32::Keyframed(keys) => keys.iter().all(|k| k.value.abs() < 1e-5),
     }
 }
 
@@ -187,21 +241,50 @@ pub(crate) fn parse_effect(v: &Value, fr: f32) -> Option<EffectSpec> {
     // parsers work without modification.
     let params = v.get("ef").and_then(Value::as_array)?;
     let prop_v = |idx: usize| params.get(idx).and_then(|p| p.get("v"));
+
+    // Author-assigned name on the effect — Lottie-Creator /
+    // Bodymovin label "Outer Glow" or "Glow" when the AE preset
+    // of the same name is attached. Detect either casing so the
+    // glow-specific path fires regardless of `ty`.
+    let is_glow_named = v
+        .get("nm")
+        .and_then(Value::as_str)
+        .map(|s| s.to_ascii_lowercase().contains("glow"))
+        .unwrap_or(false);
+
     match ty {
-        25 => Some(EffectSpec::DropShadow {
-            color: parse_animated_vec4(prop_v(0), fr)
-                .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0])),
-            // Opacity authored as 0–255 in AE's Drop Shadow dialog;
-            // normalise once at load so renderers see the Blinc
-            // convention (0–1). Any keyframe values outside that
-            // range clamp at sample time via `Color::rgba` below.
-            opacity: parse_animated_scalar(prop_v(1), fr)
+        25 => {
+            // Drop Shadow parameters — used both for a true drop
+            // shadow and (with zero distance) for the "symmetric
+            // halo" idiom that some authoring tools export as a
+            // Glow preset. Two conditions collapse to Glow:
+            //   1. The effect is named "Glow" / "Outer Glow".
+            //   2. The distance track is statically zero.
+            // Otherwise we keep the Drop Shadow shape so the
+            // offset / direction inputs still apply.
+            let color = parse_animated_vec4(prop_v(0), fr)
+                .unwrap_or(AnimatedVec4::Static([0.0, 0.0, 0.0, 1.0]));
+            let opacity = parse_animated_scalar(prop_v(1), fr)
                 .unwrap_or(AnimatedF32::Static(255.0))
-                .map(|o| (o / 255.0).clamp(0.0, 1.0)),
-            direction: parse_animated_scalar(prop_v(2), fr).unwrap_or(AnimatedF32::Static(0.0)),
-            distance: parse_animated_scalar(prop_v(3), fr).unwrap_or(AnimatedF32::Static(0.0)),
-            softness: parse_animated_scalar(prop_v(4), fr).unwrap_or(AnimatedF32::Static(0.0)),
-        }),
+                .map(|o| (o / 255.0).clamp(0.0, 1.0));
+            let direction = parse_animated_scalar(prop_v(2), fr).unwrap_or(AnimatedF32::Static(0.0));
+            let distance = parse_animated_scalar(prop_v(3), fr).unwrap_or(AnimatedF32::Static(0.0));
+            let softness = parse_animated_scalar(prop_v(4), fr).unwrap_or(AnimatedF32::Static(0.0));
+            if is_glow_named || is_zero_scalar(&distance) {
+                return Some(EffectSpec::Glow {
+                    color,
+                    opacity,
+                    softness,
+                });
+            }
+            Some(EffectSpec::DropShadow {
+                color,
+                opacity,
+                direction,
+                distance,
+                softness,
+            })
+        }
         29 => Some(EffectSpec::Blur {
             radius: parse_animated_scalar(prop_v(0), fr).unwrap_or(AnimatedF32::Static(0.0)),
         }),
@@ -2069,6 +2152,103 @@ mod tests {
                 assert!((blur - 5.0).abs() < 1e-5);
                 assert!((color.a - 128.0 / 255.0).abs() < 1e-3, "alpha = {}", color.a);
             }
+            other => panic!("expected DropShadow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glow_detected_via_effect_name() {
+        // Same JSON shape as Drop Shadow but named "Outer Glow" —
+        // authoring tools emit the glow preset this way.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff",
+            "ef": [
+                {
+                    "ty": 25,
+                    "nm": "Outer Glow",
+                    "ef": [
+                        { "ty": 2, "nm": "Color",    "v": { "k": [1.0, 0.8, 0.2, 1.0] } },
+                        { "ty": 7, "nm": "Opacity",  "v": { "k": 200.0 } },
+                        { "ty": 0, "nm": "Direction","v": { "k": 135.0 } },
+                        { "ty": 0, "nm": "Distance", "v": { "k": 5.0 } },
+                        { "ty": 0, "nm": "Softness", "v": { "k": 12.0 } }
+                    ]
+                }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        assert_eq!(layer.effects.len(), 1);
+        match layer.effects[0].sample(0.0) {
+            LayerEffect::Glow { blur, range, color, .. } => {
+                assert!((blur - 12.0 * 0.7).abs() < 1e-5);
+                assert!((range - 12.0).abs() < 1e-5);
+                // Color opacity fold: 200/255 ≈ 0.784
+                assert!((color.a - 200.0 / 255.0).abs() < 1e-3);
+            }
+            other => panic!("expected Glow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glow_detected_via_zero_distance_heuristic() {
+        // Authoring idiom: zero-offset Drop Shadow for a symmetric
+        // halo → treat as Glow automatically, even without a
+        // "glow" name.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff",
+            "ef": [
+                {
+                    "ty": 25,
+                    "nm": "Drop Shadow",
+                    "ef": [
+                        { "ty": 2, "nm": "Color",    "v": { "k": [0.5, 0.9, 1.0, 1.0] } },
+                        { "ty": 7, "nm": "Opacity",  "v": { "k": 255.0 } },
+                        { "ty": 0, "nm": "Direction","v": { "k": 0.0 } },
+                        { "ty": 0, "nm": "Distance", "v": { "k": 0.0 } },
+                        { "ty": 0, "nm": "Softness", "v": { "k": 20.0 } }
+                    ]
+                }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        match layer.effects[0].sample(0.0) {
+            LayerEffect::Glow { range, .. } => {
+                assert!((range - 20.0).abs() < 1e-5);
+            }
+            other => panic!("expected Glow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_shadow_with_nonzero_distance_stays_drop_shadow() {
+        // Confirm the heuristic doesn't false-positive — a
+        // drop shadow with a real offset must not collapse to
+        // Glow.
+        let v = json!({
+            "ty": 1,
+            "ip": 0, "op": 60,
+            "sw": 100.0, "sh": 100.0, "sc": "#ffffff",
+            "ef": [
+                {
+                    "ty": 25,
+                    "nm": "Drop Shadow",
+                    "ef": [
+                        { "ty": 2, "nm": "Color",    "v": { "k": [0.0, 0.0, 0.0, 1.0] } },
+                        { "ty": 7, "nm": "Opacity",  "v": { "k": 128.0 } },
+                        { "ty": 0, "nm": "Direction","v": { "k": 135.0 } },
+                        { "ty": 0, "nm": "Distance", "v": { "k": 10.0 } },
+                        { "ty": 0, "nm": "Softness", "v": { "k": 5.0 } }
+                    ]
+                }
+            ]
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        match layer.effects[0].sample(0.0) {
+            LayerEffect::DropShadow { .. } => {}
             other => panic!("expected DropShadow, got {other:?}"),
         }
     }
