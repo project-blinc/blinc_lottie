@@ -128,12 +128,24 @@ it.
 
 ## Phase 4 — Advanced layer types
 
-- [ ] **Text layers (`ty: 5`)**
-  - **Why:** Text callouts, lower thirds, kinetic typography.
-  - **How:** Font resolution and shaping go through `blinc_text`; add
-    it as a dependency. Animated per-character text (`t.p.a`) is a
-    big feature — stub with per-layer text first, add character
-    animation later.
+- [x] **Text layers (`ty: 5`)** — shipped, per-layer text.
+  `LayerKind::Text(TextSpec)` parses the first text-document
+  keyframe: content, font family, fill color, font size,
+  justification (`j` → `TextAlign::{Left,Right,Center}`),
+  tracking (letter-spacing), and line height (`lh`, defaults to
+  `1.2 × size`). Rendering delegates to
+  [`blinc_core::DrawContext::draw_text`] so the same glyph atlas
+  / SDF pipeline handles both layout-text and lottie-text —
+  `blinc_text` as a direct dep isn't needed because the canvas
+  text path (fixed separately) already shapes + rasterises. Each
+  line in a multi-line document renders on its own baseline at
+  `line_index × line_height`. Follow-ups:
+  - Animated-text keyframing (different strings at different
+    scene times) — parse only uses the first keyframe's `s`.
+  - Text-range animators (`t.a`) — the per-character bounce /
+    wave effects; needs per-character transform composition.
+  - Right-to-left justification modes (`j: 3` / `4`) collapse to
+    Left.
 
 - [ ] **Image layers (`ty: 2`)**
   - **Why:** Hybrid vector/raster compositions.

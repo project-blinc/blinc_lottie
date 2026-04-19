@@ -288,10 +288,46 @@ pub(crate) enum LayerKind {
         /// scrubs, loops, and speed ramps on the precomp's timeline.
         time_remap: Option<AnimatedF32>,
     },
-    /// Layer types not yet implemented (image, text, …).
+    /// Text layer (`ty: 5`). Carries a single text document (first
+    /// keyframe only — animated-text keyframing where different
+    /// strings appear at different times is tracked as follow-up).
+    /// Renders through [`blinc_core::DrawContext::draw_text`] so
+    /// the glyph pipeline reuse shares atlases with layout-level
+    /// text.
+    Text(TextSpec),
+    /// Layer types not yet implemented (image, …).
     /// Render as a no-op so the rest of the scene still composites
     /// correctly.
     Unknown,
+}
+
+/// Parsed Lottie text-document payload. Covers the subset that
+/// real-world assets actually use — per-character animation
+/// (`t.p.a`) is tracked as follow-up; the spec's text-range
+/// animators (`t.a`) likewise.
+#[derive(Debug, Clone)]
+pub(crate) struct TextSpec {
+    /// Literal text content. Newlines ("\r" / "\n") split into
+    /// multiple lines at render time.
+    pub text: String,
+    /// Font size in source-space pixels (pre-DPI). The
+    /// `DrawContext::draw_text` path scales to physical pixels.
+    pub size: f32,
+    /// Fill color in 0–1 RGBA.
+    pub color: [f32; 4],
+    /// Horizontal justification (Lottie `j`: 0 = left, 1 = right,
+    /// 2 = center). Right-to-left authoring isn't emitted by the
+    /// tools we track, so `j: 3` / `4` (RTL) collapse to Left.
+    pub align: blinc_core::TextAlign,
+    /// Optional author-supplied font family. `None` falls through
+    /// to Blinc's system-ui default via `TextStyle::default`.
+    pub family: Option<String>,
+    /// Letter-spacing in source-space pixels.
+    pub tracking: f32,
+    /// Line-height in source-space pixels (`lh` field). Falls back
+    /// to `size * 1.2` when the JSON omits it, matching CSS
+    /// convention.
+    pub line_height: f32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -739,6 +775,7 @@ impl Layer {
             1 => parse_solid(v),
             3 => LayerKind::Null,
             4 => LayerKind::Shape(ShapeContent::from_layer(v, fr)),
+            5 => parse_text(v).map_or(LayerKind::Unknown, LayerKind::Text),
             _ => LayerKind::Unknown,
         };
         let masks = v
@@ -826,6 +863,18 @@ impl Layer {
                 Some(Rect::new(0.0, 0.0, *width, *height))
             }
             LayerKind::Shape(content) => content.local_bounds(scene_t),
+            LayerKind::Text(spec) => {
+                // Conservative estimate — real width requires a
+                // live text-context measurement the cull doesn't
+                // have. Font-size × char-count × 0.8 overshoots
+                // typical widths, which means no false-culls
+                // (better than false-rendering an invisible box).
+                let lines = spec.text.lines().count().max(1) as f32;
+                let chars = spec.text.chars().count().max(1) as f32;
+                let h = spec.line_height.max(spec.size) * lines + spec.size;
+                let w = spec.size * 0.8 * chars;
+                Some(Rect::new(0.0, -spec.size, w, h))
+            }
             LayerKind::Precomp { width, height, .. } => {
                 // Precomps clip to their authored canvas size, so
                 // that rect is a tight cull bound regardless of
@@ -924,6 +973,9 @@ impl Layer {
             }
             LayerKind::Shape(content) => {
                 content.render(dc, scene_t);
+            }
+            LayerKind::Text(spec) => {
+                render_text_layer(dc, spec);
             }
             LayerKind::Precomp {
                 layers,
@@ -1066,6 +1118,75 @@ fn parse_precomp(v: &Value, fr: f32, ctx: Option<&AssetContext<'_>>) -> LayerKin
         start_seconds: start_frames / fr,
         time_remap,
     }
+}
+
+/// Parse a Lottie text layer's document (`t.d.k[0].s`). The text
+/// document carries every field we actually consume — content,
+/// font family, fill color, size, justification, tracking, line
+/// height. Animated text (multiple keyframes with different
+/// strings) picks only the first keyframe here; scene-time-varying
+/// content is a follow-up.
+fn parse_text(v: &Value) -> Option<TextSpec> {
+    use blinc_core::TextAlign;
+    let doc = v
+        .get("t")
+        .and_then(|t| t.get("d"))
+        .and_then(|d| d.get("k"))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|frame| frame.get("s"))?;
+
+    // `t` on the document is the literal text content. An empty or
+    // missing string renders nothing useful — treat as unparseable.
+    let text = doc.get("t").and_then(Value::as_str)?.to_string();
+    let size = doc
+        .get("s")
+        .and_then(Value::as_f64)
+        .map(|n| n as f32)
+        .unwrap_or(12.0);
+    let color = doc
+        .get("fc")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            let r = arr.first().and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let g = arr.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let b = arr.get(2).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let a = arr.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            [r, g, b, a]
+        })
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let align = match doc.get("j").and_then(Value::as_u64).unwrap_or(0) {
+        1 => TextAlign::Right,
+        2 => TextAlign::Center,
+        // 0 (Left) and any unknown value (3/4 = RTL variants we
+        // don't special-case) fall back to Left alignment.
+        _ => TextAlign::Left,
+    };
+    let family = doc
+        .get("f")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let tracking = doc
+        .get("tr")
+        .and_then(Value::as_f64)
+        .map(|n| n as f32)
+        .unwrap_or(0.0);
+    let line_height = doc
+        .get("lh")
+        .and_then(Value::as_f64)
+        .map(|n| n as f32)
+        .unwrap_or(size * 1.2);
+
+    Some(TextSpec {
+        text,
+        size,
+        color,
+        align,
+        family,
+        tracking,
+        line_height,
+    })
 }
 
 fn parse_solid(v: &Value) -> LayerKind {
@@ -1391,6 +1512,42 @@ pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
     dc.pop_transform();
     dc.pop_transform();
     dc.pop_transform();
+}
+
+/// Render a Lottie text layer's single text document into `dc`.
+/// Splits the text on newlines so multi-line documents honour
+/// line height; positions each line's baseline at
+/// `(line_index + 1) * line_height` from the layer origin (Lottie
+/// convention: the layer's anchor is at the first line's baseline,
+/// subsequent lines descend below).
+fn render_text_layer(dc: &mut dyn DrawContext, spec: &TextSpec) {
+    use blinc_core::{Color, Point, TextStyle};
+    let color = Color::rgba(spec.color[0], spec.color[1], spec.color[2], spec.color[3]);
+    let mut style = TextStyle::default()
+        .with_color(color)
+        .with_align(spec.align);
+    style.size = spec.size;
+    style.letter_spacing = spec.tracking;
+    style.line_height = if spec.size > 0.0 {
+        spec.line_height / spec.size
+    } else {
+        1.2
+    };
+    if let Some(family) = &spec.family {
+        style = style.with_family(family.clone());
+    }
+
+    // Baseline y stepping: first line sits at y = 0 (the layer's
+    // anchor is on that baseline by Lottie convention); each
+    // subsequent line descends by `line_height`. Alphabetic
+    // baseline — matches the TextStyle default.
+    for (line_idx, line) in spec.text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let y = line_idx as f32 * spec.line_height;
+        dc.draw_text(line, Point::new(0.0, y), &style);
+    }
 }
 
 /// Push a parent's transform onto the stack without its opacity.
@@ -1926,6 +2083,100 @@ mod tests {
         let unknown = json!({ "ty": 99, "ip": 0, "op": 60 });
         assert!(Layer::from_value(&null, 60.0).source_bounds(0.0).is_none());
         assert!(Layer::from_value(&unknown, 60.0).source_bounds(0.0).is_none());
+    }
+
+    #[test]
+    fn text_layer_parses_document_fields() {
+        use blinc_core::TextAlign;
+        let v = json!({
+            "ty": 5,
+            "ip": 0, "op": 60,
+            "ks": { "p": { "k": [100.0, 200.0, 0.0] } },
+            "t": {
+                "d": {
+                    "k": [
+                        {
+                            "t": 0,
+                            "s": {
+                                "t": "Hello",
+                                "f": "Inter",
+                                "fc": [1.0, 0.5, 0.25, 1.0],
+                                "s": 36.0,
+                                "j": 2,
+                                "tr": 50.0,
+                                "lh": 48.0
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        match &layer.kind {
+            LayerKind::Text(spec) => {
+                assert_eq!(spec.text, "Hello");
+                assert_eq!(spec.family.as_deref(), Some("Inter"));
+                assert_eq!(spec.color, [1.0, 0.5, 0.25, 1.0]);
+                assert!((spec.size - 36.0).abs() < 1e-6);
+                assert!(matches!(spec.align, TextAlign::Center));
+                assert!((spec.tracking - 50.0).abs() < 1e-6);
+                assert!((spec.line_height - 48.0).abs() < 1e-6);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_layer_justification_variants_map_correctly() {
+        use blinc_core::TextAlign;
+        let mk = |j: u64| {
+            json!({
+                "ty": 5, "ip": 0, "op": 60,
+                "t": { "d": { "k": [{ "t": 0, "s": { "t": "x", "s": 12.0, "j": j } }] } }
+            })
+        };
+        let a = Layer::from_value(&mk(0), 60.0);
+        let b = Layer::from_value(&mk(1), 60.0);
+        let c = Layer::from_value(&mk(2), 60.0);
+        if let LayerKind::Text(s) = &a.kind {
+            assert!(matches!(s.align, TextAlign::Left));
+        } else {
+            panic!();
+        }
+        if let LayerKind::Text(s) = &b.kind {
+            assert!(matches!(s.align, TextAlign::Right));
+        } else {
+            panic!();
+        }
+        if let LayerKind::Text(s) = &c.kind {
+            assert!(matches!(s.align, TextAlign::Center));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn text_layer_without_document_falls_back_to_unknown() {
+        // No `t` field on a ty:5 layer → parse fails → Unknown.
+        let v = json!({ "ty": 5, "ip": 0, "op": 60 });
+        let layer = Layer::from_value(&v, 60.0);
+        assert!(matches!(layer.kind, LayerKind::Unknown));
+    }
+
+    #[test]
+    fn text_layer_defaults_line_height_to_1_2x_size() {
+        let v = json!({
+            "ty": 5, "ip": 0, "op": 60,
+            "t": { "d": { "k": [{ "t": 0, "s": { "t": "x", "s": 20.0 } }] } }
+        });
+        let layer = Layer::from_value(&v, 60.0);
+        match &layer.kind {
+            LayerKind::Text(spec) => {
+                // Missing `lh` → 1.2 * size
+                assert!((spec.line_height - 24.0).abs() < 1e-5);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[test]
