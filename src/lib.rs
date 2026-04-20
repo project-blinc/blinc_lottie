@@ -452,17 +452,30 @@ impl LottiePlayer {
     /// same player. Used by [`crate::state_machine::LottieStateMachine`]
     /// to render the source pose during a Tweened crossfade.
     pub fn draw_frame(&self, ctx: &mut SketchContext<'_>, rect: Rect, scene_t: f32) {
+        let fit = aspect_fit(self.root.width, self.root.height, rect);
         let src_w = self.root.width.max(1) as f32;
         let src_h = self.root.height.max(1) as f32;
-        let sx = rect.width() / src_w;
-        let sy = rect.height() / src_h;
+        let sx = fit.width() / src_w;
+        let sy = fit.height() / src_h;
+
+        let local_root = source_to_dest_affine(fit.x(), fit.y(), sx, sy);
 
         let dc: &mut dyn DrawContext = ctx.draw_context();
-        dc.push_transform(Transform::translate(rect.x(), rect.y()));
+        // Clip to the comp's fitted rect in sketch-local space. Lottie
+        // compositions can contain layers whose rendered bounds extend
+        // past the declared `w`/`h` (decorative backgrounds, bleed
+        // layers); preview tooling clips them to the comp rect. Without
+        // this clip those layers spill out of `fit` into the host
+        // canvas, which the gallery surfaces as wavy background shapes
+        // stretching to the card edges instead of being bounded to the
+        // comp.
+        dc.push_clip(blinc_core::layer::ClipShape::rect(fit));
+        dc.push_transform(Transform::translate(fit.x(), fit.y()));
         dc.push_transform(Transform::scale(sx, sy));
-        render_layer_stack(dc, &self.layers, rect, scene_t);
+        render_layer_stack(dc, &self.layers, fit, scene_t, &local_root);
         dc.pop_transform();
         dc.pop_transform();
+        dc.pop_clip();
     }
 
     /// Fire the marker callback for every marker whose timestamp falls in
@@ -509,17 +522,26 @@ impl Player for LottiePlayer {
         self.fire_markers(prev, scene_t);
         self.last_scene_t = scene_t;
 
-        // Map Lottie source-space coordinates onto the destination rect.
-        // Stretches the composition to fill — aspect-fit / aspect-fill
-        // modes are intentionally deferred (track via README Phase 5
-        // perf/format work).
+        // Aspect-fit the composition's native viewport (`root.w` / `h`)
+        // inside `rect`. The caller passes a target area; the player
+        // fits its own declared size in without distortion and centres
+        // the result. Aspect-fill is a follow-up (would letterbox or
+        // zoom to cover instead of shrink to fit).
+        let fit = aspect_fit(self.root.width, self.root.height, rect);
         let src_w = self.root.width.max(1) as f32;
         let src_h = self.root.height.max(1) as f32;
-        let sx = rect.width() / src_w;
-        let sy = rect.height() / src_h;
+        let sx = fit.width() / src_w;
+        let sy = fit.height() / src_h;
+
+        let local_root = source_to_dest_affine(fit.x(), fit.y(), sx, sy);
 
         let dc: &mut dyn DrawContext = ctx.draw_context();
-        dc.push_transform(Transform::translate(rect.x(), rect.y()));
+        // Clip to the fitted comp rect in sketch-local space — see
+        // `draw_frame` for the rationale (bleed layers whose source
+        // bounds legitimately extend past the declared `w`/`h` would
+        // otherwise paint outside the dest rect).
+        dc.push_clip(blinc_core::layer::ClipShape::rect(fit));
+        dc.push_transform(Transform::translate(fit.x(), fit.y()));
         dc.push_transform(Transform::scale(sx, sy));
 
         // Lottie convention: layers earlier in the array composite on
@@ -535,10 +557,11 @@ impl Player for LottiePlayer {
         // render. Parent-chain push/pop still happens for culled
         // layers — it's cheap compared to `push_layer`'s
         // offscreen setup for shadow / blur effects.
-        render_layer_stack(dc, &self.layers, rect, scene_t);
+        render_layer_stack(dc, &self.layers, fit, scene_t, &local_root);
 
         dc.pop_transform();
         dc.pop_transform();
+        dc.pop_clip();
     }
 
     fn seek(&mut self, t: f32) {
@@ -567,6 +590,41 @@ impl Player for LottiePlayer {
     }
 }
 
+/// Return the largest rect with aspect ratio `src_w` / `src_h` that
+/// fits inside `dest`, centred along whichever axis has slack. Used
+/// by `draw_at` / `draw_frame` so the composition keeps its native
+/// proportions instead of stretching to fill — e.g. a 283×376
+/// portrait comp drawn into a 316×316 square lands as a centred
+/// 237×316 rect with horizontal letterboxing rather than a stretched
+/// 316×316. Zero / negative source dimensions fall back to `dest`
+/// unchanged (nothing sensible to fit).
+fn aspect_fit(src_w: u32, src_h: u32, dest: Rect) -> Rect {
+    if src_w == 0 || src_h == 0 {
+        return dest;
+    }
+    let sw = src_w as f32;
+    let sh = src_h as f32;
+    let scale = (dest.width() / sw).min(dest.height() / sh);
+    let w = sw * scale;
+    let h = sh * scale;
+    let x = dest.x() + (dest.width() - w) * 0.5;
+    let y = dest.y() + (dest.height() - h) * 0.5;
+    Rect::new(x, y, w, h)
+}
+
+/// Build the `T(tx, ty) · S(sx, sy)` affine `draw_at` and `draw_frame`
+/// push onto the `DrawContext` to map Lottie source space onto their
+/// `dest` rect. Passed into `render_layer_stack` so `cull_layer` can
+/// evaluate the cull AABB in the same sketch-local frame `dest` lives
+/// in — pulling the equivalent out of `dc.current_transform()` would
+/// also fold in every outer render-pipeline translate, putting the
+/// bounds in screen space where they never intersect a local `dest`.
+fn source_to_dest_affine(tx: f32, ty: f32, sx: f32, sy: f32) -> blinc_core::layer::Affine2D {
+    blinc_core::layer::Affine2D {
+        elements: [sx, 0.0, 0.0, sy, tx, ty],
+    }
+}
+
 /// Shared render walker used by both `Player::draw_at` and
 /// `LottiePlayer::draw_frame`. Iterates back-to-front, honours
 /// parent chains, off-screen culling, and track mattes. The
@@ -577,6 +635,7 @@ fn render_layer_stack(
     layers: &[Layer],
     dest: Rect,
     scene_t: f32,
+    local_root: &blinc_core::layer::Affine2D,
 ) {
     for (i, layer) in layers.iter().enumerate().rev() {
         // Matte sources never render on their own — only their
@@ -601,7 +660,7 @@ fn render_layer_stack(
         // composite to honour faithfully; tracked as follow-up.
         let matte_pushed = push_matte_clip(dc, layers, i, scene_t);
 
-        if cull_layer(layers, i, dc, dest, scene_t) {
+        if cull_layer(layers, i, local_root, dest, scene_t) {
             if matte_pushed {
                 dc.pop_clip();
             }
@@ -728,7 +787,7 @@ fn transform_matte_command(
 fn cull_layer(
     layers: &[Layer],
     idx: usize,
-    dc: &mut dyn blinc_core::DrawContext,
+    local_root: &blinc_core::layer::Affine2D,
     dest: Rect,
     scene_t: f32,
 ) -> bool {
@@ -736,10 +795,21 @@ fn cull_layer(
     let Some(bounds) = layer.source_bounds(scene_t) else {
         return false;
     };
-    let parent = match dc.current_transform() {
-        Transform::Affine2D(a) => a,
-        Transform::Mat4(_) => return false,
-    };
+    // Compose `local_root` (T(rect.xy) · S(sx, sy) — the mapping from
+    // Lottie source space to sketch-local dest space applied by the
+    // caller in `draw_at`) with the layer's parent chain and the
+    // layer's own transform. Deliberately does NOT consult
+    // `dc.current_transform()`: that would fold in every outer
+    // render-pipeline translate (e.g. the ~360 px offset of a
+    // second sibling canvas), producing a screen-space AABB that
+    // can never intersect `dest` — which stays in sketch-local
+    // coordinates. For the gallery's second card that mismatch was
+    // culling every layer and leaving the canvas blank.
+    let mut parent = *local_root;
+    for &anc_idx in &layer.parent_chain {
+        let anc_local = layer::layer_local_affine(&layers[anc_idx].transform.sample(scene_t));
+        parent = layer::multiply_affines(&parent, &anc_local);
+    }
     let local = layer::layer_local_affine(&layer.transform.sample(scene_t));
     let composed = layer::multiply_affines(&parent, &local);
     !layer::transformed_aabb_intersects(&composed, bounds, &dest)
