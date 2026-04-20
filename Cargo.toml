@@ -99,3 +99,11 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 [[example]]
 name = "sandy_loading"
 path = "examples/sandy_loading.rs"
+
+[[example]]
+name = "sandy_loading_dotlottie"
+path = "examples/sandy_loading_dotlottie.rs"
+
+[[example]]
+name = "lottie_gallery"
+path = "examples/lottie_gallery.rs"
