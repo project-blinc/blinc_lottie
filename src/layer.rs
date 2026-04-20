@@ -1796,24 +1796,6 @@ pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
     dc.pop_transform();
 }
 
-/// Same as [`push_layer_transform`] but skips the opacity push, used
-/// when the layer's render is already inside a `push_layer`/`pop_layer`
-/// offscreen composite that holds the opacity. Pushing again would
-/// multiply it twice.
-pub(crate) fn push_layer_transform_no_opacity(dc: &mut dyn DrawContext, xform: &SampledTransform) {
-    dc.push_transform(Transform::translate(xform.position[0], xform.position[1]));
-    dc.push_transform(Transform::rotate(xform.rotation));
-    dc.push_transform(Transform::scale(xform.scale[0], xform.scale[1]));
-    dc.push_transform(Transform::translate(-xform.anchor[0], -xform.anchor[1]));
-}
-
-pub(crate) fn pop_layer_transform_no_opacity(dc: &mut dyn DrawContext) {
-    dc.pop_transform();
-    dc.pop_transform();
-    dc.pop_transform();
-    dc.pop_transform();
-}
-
 /// Render a Lottie text document into `dc`. Splits the text on
 /// newlines so multi-line documents honour line height; positions
 /// each line's baseline at `line_index × line_height` from the
