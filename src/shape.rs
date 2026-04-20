@@ -56,16 +56,36 @@ pub(crate) struct ShapeContent {
 pub(crate) struct ShapeGroup {
     /// Group transform from the `tr` shape item. `None` means identity.
     transform: Option<TransformSpec>,
-    geometries: Vec<Geometry>,
-    fill: Option<FillSpec>,
-    stroke: Option<StrokeSpec>,
-    /// Trim-path state from `tm`. When present, each geometry is
-    /// flattened to a polyline, clipped to the trimmed arc-length
-    /// window, and re-emitted before fill / stroke. `None` for
-    /// groups without trim data (the common case).
+    /// Paint passes within this group. Each pass owns its own
+    /// geometries + fill + stroke so that authors can stack
+    /// multiple fills inside a single `gr` (the After Effects
+    /// convention: each `fl` / `st` paints the geometries that
+    /// preceded it since the last paint item). A group with just
+    /// one fill collapses to a single pass — the common case. The
+    /// group's `trim` applies to each pass independently.
+    paints: Vec<PaintPass>,
+    /// Trim-path state from `tm`. When present, each pass's
+    /// geometries are flattened to a polyline, clipped to the
+    /// trimmed arc-length window, and re-emitted before fill /
+    /// stroke. `None` for groups without trim data (the common
+    /// case).
     trim: Option<TrimPathSpec>,
     /// Nested `gr` groups — render after this group's own paint pass.
     children: Vec<ShapeGroup>,
+}
+
+/// One paint-batch inside a [`ShapeGroup`]. Lottie groups can carry
+/// multiple `fl` / `st` items interleaved with geometries, where each
+/// paint item consumes the geometries that appeared since the last
+/// paint (AE's "Fill / Stroke modifier" semantics). Storing each
+/// (geometries, fill, stroke) tuple as its own pass keeps the render
+/// path simple — paint each pass in its author-declared order — and
+/// matches what assets authored in After Effects expect.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PaintPass {
+    geometries: Vec<Geometry>,
+    fill: Option<FillSpec>,
+    stroke: Option<StrokeSpec>,
 }
 
 /// Parsed state of a `ty: "tm"` trim-path shape item.
@@ -369,30 +389,56 @@ struct StrokeSpec {
 impl ShapeContent {
     /// Parse a `ty: 4` layer's `shapes` array. `fr` is the composition
     /// frame rate, used to convert keyframe times to seconds.
+    ///
+    /// A `tm` item that appears at the layer-root level (sibling of
+    /// groups, not inside one) applies to every preceding group — the
+    /// After Effects "Trim Paths" modifier dropped on a shape layer
+    /// rather than inside a single group. Lottie serialises that the
+    /// same way: flat entries in the layer's `shapes` array. This
+    /// parser propagates a root-level trim down into each group that
+    /// doesn't already carry its own, so [`ShapeGroup::render`] picks
+    /// it up through the same render path as group-local trims.
+    /// Without this, loading-spinner assets that author a rotating
+    /// arc via one stroked ellipse + one layer-root `tm` render as
+    /// a full closed ring.
     pub fn from_layer(v: &Value, fr: f32) -> Self {
         let shapes = v.get("shapes").and_then(Value::as_array);
-        let groups = match shapes {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|s| {
-                    let ty = s.get("ty").and_then(Value::as_str)?;
-                    if ty == "gr" {
-                        Some(parse_group(s, fr))
-                    } else {
-                        // Bare geometry without an enclosing group is rare
-                        // but legal — wrap in a synthetic group so the
-                        // render path stays uniform.
-                        single_item_group(s, fr)
+        let mut groups: Vec<ShapeGroup> = Vec::new();
+        let mut root_trim: Option<TrimPathSpec> = None;
+        if let Some(arr) = shapes {
+            for s in arr {
+                let Some(ty) = s.get("ty").and_then(Value::as_str) else {
+                    continue;
+                };
+                match ty {
+                    "gr" => groups.push(parse_group(s, fr)),
+                    "tm" => {
+                        // Last-writer-wins: multiple root-level trims on
+                        // the same layer would already collapse inside AE.
+                        root_trim = Some(parse_trim_path(s, fr));
                     }
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+                    _ => {
+                        if let Some(g) = single_item_group(s, fr) {
+                            groups.push(g);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(spec) = root_trim {
+            for group in groups.iter_mut() {
+                if group.trim.is_none() {
+                    group.trim = Some(spec.clone());
+                }
+            }
+        }
         Self { groups }
     }
 
     pub fn render(&self, dc: &mut dyn DrawContext, t: f32) {
-        for group in &self.groups {
+        // Same rule as ShapeGroup::render — first-declared top-level
+        // group sits on TOP (per Lottie spec), so iterate in reverse.
+        for group in self.groups.iter().rev() {
             group.render(dc, t);
         }
     }
@@ -438,37 +484,49 @@ impl ShapeContent {
     }
 }
 
+#[cfg(test)]
 impl ShapeGroup {
-    fn render(&self, dc: &mut dyn DrawContext, t: f32) {
-        let pushed = self
-            .transform
-            .as_ref()
-            .map(|ts| {
-                let xf = ts.sample(t);
-                push_layer_transform(dc, &xf);
-            })
-            .is_some();
+    /// Test helper: flatten every paint pass's geometries into a
+    /// single `Vec`. The production render path iterates
+    /// `self.paints` directly; this accessor exists so the parser
+    /// tests can still assert on geometry counts after the
+    /// multi-paint refactor without rewriting every single site.
+    pub(crate) fn all_geometries(&self) -> Vec<&Geometry> {
+        self.paints
+            .iter()
+            .flat_map(|p| p.geometries.iter())
+            .collect()
+    }
 
-        // Sample the trim window once per frame so every geometry
-        // in the group sees the same cut.
-        let trim_window = self
-            .trim
-            .as_ref()
-            .map(|tm| sample_trim_window(tm, t))
-            .filter(|window| window.has_visible_range());
-        let trim_mode = self.trim.as_ref().map(|tm| tm.mode);
+    /// Test helper: the first paint pass's fill. A group with a
+    /// single author-declared fill produces exactly one pass, so
+    /// this matches the pre-refactor `ShapeGroup.fill` semantics
+    /// for every test covering that common case.
+    pub(crate) fn first_fill(&self) -> Option<&FillSpec> {
+        self.paints.iter().find_map(|p| p.fill.as_ref())
+    }
 
-        // Assemble the paths that this group will paint. For
-        // `Simultaneous` mode we concatenate every geometry's
-        // commands into a single `Path`, trim that, and paint once
-        // — the `s` and `e` percentages span the TOTAL arc length
-        // across all geometries, which is what AE's "Simultaneously"
-        // option produces. For `Individual` (or no trim) we keep
-        // the per-geometry loop so paths that are drawn with
-        // different fills / strokes still render separately.
+    /// Test helper: the first paint pass's stroke.
+    pub(crate) fn first_stroke(&self) -> Option<&StrokeSpec> {
+        self.paints.iter().find_map(|p| p.stroke.as_ref())
+    }
+}
+
+impl PaintPass {
+    fn render(
+        &self,
+        dc: &mut dyn DrawContext,
+        t: f32,
+        trim_window: Option<TrimWindow>,
+        trim_mode: Option<TrimMode>,
+    ) {
+        // Assemble the paths this pass paints. `Simultaneous` trim
+        // concatenates every geometry's commands into one path and
+        // slices the unified arc length once — matches AE's
+        // "Simultaneously" option. `Individual` (or no trim) keeps
+        // per-geometry paths so complex groups still read correctly.
         let paths_to_paint: Vec<Path> = match (trim_window, trim_mode) {
             (Some(window), Some(TrimMode::Simultaneous)) => {
-                // Concatenate every geometry's commands into one path.
                 let mut combined: Vec<PathCommand> = Vec::new();
                 for geo in &self.geometries {
                     for cmd in geo.to_path(t).commands() {
@@ -521,8 +579,44 @@ impl ShapeGroup {
                 }
             }
         }
+    }
+}
 
-        for child in &self.children {
+impl ShapeGroup {
+    fn render(&self, dc: &mut dyn DrawContext, t: f32) {
+        let pushed = self
+            .transform
+            .as_ref()
+            .map(|ts| {
+                let xf = ts.sample(t);
+                push_layer_transform(dc, &xf);
+            })
+            .is_some();
+
+        // Sample the trim window once per frame so every paint pass
+        // in the group sees the same cut.
+        let trim_window = self
+            .trim
+            .as_ref()
+            .map(|tm| sample_trim_window(tm, t))
+            .filter(|window| window.has_visible_range());
+        let trim_mode = self.trim.as_ref().map(|tm| tm.mode);
+
+        // Lottie renders items in `it[]` in REVERSE author order —
+        // the first-declared item sits on TOP, the last at the
+        // bottom. Same rule applies at every nesting level, including
+        // sibling groups inside a shape layer and nested `gr`
+        // children. Sandy_Loading's `Sand Dessert Outlines 2` has
+        // Group 5 (orange sand pile) before Group 7 (pink bowl);
+        // forward iteration painted pink on top and hid the orange,
+        // which is why the bowl looked empty in our render. Ditto
+        // for the cap layers where the dark main body is
+        // later-declared than the teal highlight.
+        for paint in self.paints.iter().rev() {
+            paint.render(dc, t, trim_window, trim_mode);
+        }
+
+        for child in self.children.iter().rev() {
             child.render(dc, t);
         }
 
@@ -531,20 +625,23 @@ impl ShapeGroup {
         }
     }
 
-    /// Append every geometry's path commands to `out`, transformed
-    /// through this group's own `tr` affine (if present) and
-    /// recursing into nested children. Used by track mattes — the
-    /// accumulated commands flatten the entire shape tree into a
-    /// single multi-subpath `Path` that the clip stack can honour.
+    /// Append every geometry's path commands (across all paint
+    /// passes) to `out`, transformed through this group's own `tr`
+    /// affine (if present) and recursing into nested children. Used
+    /// by track mattes — the accumulated commands flatten the entire
+    /// shape tree into a single multi-subpath `Path` that the clip
+    /// stack can honour.
     fn accumulate_clip_commands(&self, out: &mut Vec<PathCommand>, t: f32) {
         let affine = self.transform.as_ref().map(|ts| {
             let xf = ts.sample(t);
             crate::layer::layer_local_affine(&xf)
         });
-        for geo in &self.geometries {
-            let path = geo.to_path(t);
-            for cmd in path.commands() {
-                out.push(transform_path_command(cmd, affine.as_ref()));
+        for paint in &self.paints {
+            for geo in &paint.geometries {
+                let path = geo.to_path(t);
+                for cmd in path.commands() {
+                    out.push(transform_path_command(cmd, affine.as_ref()));
+                }
             }
         }
         for child in &self.children {
@@ -560,9 +657,11 @@ impl ShapeGroup {
     /// shape, so the pre-trim bound is a correct superset.
     fn local_bounds(&self, t: f32) -> Option<Rect> {
         let mut out: Option<Rect> = None;
-        for geo in &self.geometries {
-            if let Some(b) = geo.local_bounds(t) {
-                out = Some(merge_rects(out, b));
+        for paint in &self.paints {
+            for geo in &paint.geometries {
+                if let Some(b) = geo.local_bounds(t) {
+                    out = Some(merge_rects(out, b));
+                }
             }
         }
         for child in &self.children {
@@ -657,7 +756,20 @@ impl TrimWindow {
         // Full-range trim (start ≈ 0, end ≈ 1) is a no-op; a degenerate
         // zero-length trim (start == end) paints nothing. Both get
         // fast-pathed here to save the flatten + walk cost.
-        let span = self.end - self.start;
+        //
+        // When the offset rotates the window across the 0/1 boundary,
+        // `sample_trim_window` produces `start > end` to signal a
+        // wrapped span. `apply_trim` handles that with a two-slice
+        // emission, so the span here is `(1 - start) + end` rather
+        // than the negative `end - start` of the raw subtraction —
+        // otherwise ~20% of a full-rotation spinner animation would
+        // take the "no visible range" fast-path and render the whole
+        // unclipped path (seen as a full loading ring on Sandy_Loading).
+        let span = if self.end >= self.start {
+            self.end - self.start
+        } else {
+            (1.0 - self.start) + self.end
+        };
         span > 1e-6 && span < 1.0 - 1e-6
     }
 
@@ -1115,53 +1227,107 @@ fn sample_paint_brush(paint: &Paint, opacity: &AnimatedF32, t: f32) -> Brush {
 fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
     let mut group = ShapeGroup {
         transform: None,
-        geometries: Vec::new(),
-        fill: None,
-        stroke: None,
+        paints: Vec::new(),
         trim: None,
         children: Vec::new(),
     };
     let Some(items) = v.get("it").and_then(Value::as_array) else {
         return group;
     };
+    // Walk items in author order, splitting on each fill / stroke
+    // into a separate paint pass. A paint item consumes the
+    // geometries that appeared since the last paint; an adjacent
+    // fill+stroke pair (no intervening geometry) share a batch so
+    // `sh, fl, st` applies both to the same shape. Without this
+    // split, authors who stack multiple colored fills inside one
+    // group (e.g. the Sandy_Loading hourglass caps — seven shapes
+    // with six colored fills alternating dark / teal) collapse
+    // onto a single last-writer-wins fill and render as one flat
+    // blob.
+    let mut pending_geoms: Vec<Geometry> = Vec::new();
+    let mut pending_fill: Option<FillSpec> = None;
+    let mut pending_stroke: Option<StrokeSpec> = None;
+    let flush = |geoms: &mut Vec<Geometry>,
+                 fill: &mut Option<FillSpec>,
+                 stroke: &mut Option<StrokeSpec>,
+                 paints: &mut Vec<PaintPass>| {
+        if geoms.is_empty() && fill.is_none() && stroke.is_none() {
+            return;
+        }
+        paints.push(PaintPass {
+            geometries: std::mem::take(geoms),
+            fill: fill.take(),
+            stroke: stroke.take(),
+        });
+    };
     for item in items {
         let Some(ty) = item.get("ty").and_then(Value::as_str) else {
             continue;
         };
         match ty {
-            "rc" => group.geometries.push(parse_rectangle(item, fr)),
-            "el" => group.geometries.push(parse_ellipse(item, fr)),
-            "sh" => group.geometries.push(parse_path(item, fr)),
-            "fl" => group.fill = Some(parse_fill(item, fr)),
-            "gf" => group.fill = Some(parse_gradient_fill(item, fr)),
-            "st" => group.stroke = Some(parse_stroke(item, fr)),
-            "gs" => group.stroke = Some(parse_gradient_stroke(item, fr)),
+            "rc" | "el" | "sh" | "sr" => {
+                // A geometry item after paints have already been
+                // committed to `pending_*` starts a new batch. The
+                // pending paint pair applies to everything *before*
+                // this geometry.
+                if pending_fill.is_some() || pending_stroke.is_some() {
+                    flush(
+                        &mut pending_geoms,
+                        &mut pending_fill,
+                        &mut pending_stroke,
+                        &mut group.paints,
+                    );
+                }
+                match ty {
+                    "rc" => pending_geoms.push(parse_rectangle(item, fr)),
+                    "el" => pending_geoms.push(parse_ellipse(item, fr)),
+                    "sh" => pending_geoms.push(parse_path(item, fr)),
+                    "sr" => {} // polystar not implemented — drop the item
+                    _ => unreachable!(),
+                }
+            }
+            "fl" => pending_fill = Some(parse_fill(item, fr)),
+            "gf" => pending_fill = Some(parse_gradient_fill(item, fr)),
+            "st" => pending_stroke = Some(parse_stroke(item, fr)),
+            "gs" => pending_stroke = Some(parse_gradient_stroke(item, fr)),
             "tr" => group.transform = Some(TransformSpec::from_value(Some(item), fr)),
             "tm" => group.trim = Some(parse_trim_path(item, fr)),
             "gr" => group.children.push(parse_group(item, fr)),
             _ => {} // unimplemented item — skip silently
         }
     }
+    // Flush anything that's still pending at the end of the items
+    // array — the common single-fill case lands here.
+    flush(
+        &mut pending_geoms,
+        &mut pending_fill,
+        &mut pending_stroke,
+        &mut group.paints,
+    );
+    // Ensure a group with no paint items (e.g. only a transform on a
+    // parent) still has a zero-length `paints` vec, which the render
+    // loop handles as a no-op.
     group
 }
 
 fn single_item_group(v: &Value, fr: f32) -> Option<ShapeGroup> {
     let ty = v.get("ty").and_then(Value::as_str)?;
-    let mut group = ShapeGroup {
+    let geom = match ty {
+        "rc" => parse_rectangle(v, fr),
+        "el" => parse_ellipse(v, fr),
+        "sh" => parse_path(v, fr),
+        _ => return None,
+    };
+    Some(ShapeGroup {
         transform: None,
-        geometries: Vec::new(),
-        fill: None,
-        stroke: None,
+        paints: vec![PaintPass {
+            geometries: vec![geom],
+            fill: None,
+            stroke: None,
+        }],
         trim: None,
         children: Vec::new(),
-    };
-    match ty {
-        "rc" => group.geometries.push(parse_rectangle(v, fr)),
-        "el" => group.geometries.push(parse_ellipse(v, fr)),
-        "sh" => group.geometries.push(parse_path(v, fr)),
-        _ => return None,
-    }
-    Some(group)
+    })
 }
 
 fn parse_trim_path(v: &Value, fr: f32) -> TrimPathSpec {
@@ -1571,12 +1737,12 @@ mod tests {
         let content = ShapeContent::from_layer(&v, 60.0);
         assert_eq!(content.groups.len(), 1);
         let g = &content.groups[0];
-        assert_eq!(g.geometries.len(), 1);
-        assert!(g.fill.is_some());
-        assert!(g.stroke.is_none());
+        assert_eq!(g.all_geometries().len(), 1);
+        assert!(g.first_fill().is_some());
+        assert!(g.first_stroke().is_none());
         assert!(g.transform.is_some(), "tr item should populate transform");
         // Fill alpha = 1.0 source * 0.75 opacity = 0.75
-        let fill = g.fill.as_ref().unwrap();
+        let fill = g.first_fill().unwrap();
         let Paint::Solid(color) = &fill.paint else {
             panic!("expected solid paint, got {:?}", fill.paint);
         };
@@ -1585,6 +1751,50 @@ mod tests {
         assert!((c.g - 0.5).abs() < 1e-5);
         assert!((c.b - 0.0).abs() < 1e-5);
         assert!((c.a - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn multi_fill_group_splits_into_paint_passes() {
+        // Pattern Sandy_Loading's Up Cap / Butt Cap layers use: a
+        // single `gr` whose `it` carries multiple `sh`+`fl` segments
+        // with different colors — AE's "paint the preceding shapes"
+        // modifier stacked N times. Each segment must land in its
+        // own PaintPass so the render stacks the colors correctly
+        // (dark base, teal highlight on top of a subset, etc).
+        let v = shape_layer_json(json!([
+            {
+                "ty": "gr",
+                "it": [
+                    { "ty": "sh", "ks": { "a": 0, "k": { "v": [[0.0, 0.0]], "i": [[0.0, 0.0]], "o": [[0.0, 0.0]], "c": true } } },
+                    { "ty": "sh", "ks": { "a": 0, "k": { "v": [[0.0, 0.0]], "i": [[0.0, 0.0]], "o": [[0.0, 0.0]], "c": true } } },
+                    { "ty": "fl", "c": { "k": [0.1137, 0.1137, 0.1059, 1.0] }, "o": { "k": 100.0 } },
+                    { "ty": "sh", "ks": { "a": 0, "k": { "v": [[0.0, 0.0]], "i": [[0.0, 0.0]], "o": [[0.0, 0.0]], "c": true } } },
+                    { "ty": "fl", "c": { "k": [0.0, 0.7098, 0.6, 1.0] }, "o": { "k": 100.0 } },
+                    { "ty": "sh", "ks": { "a": 0, "k": { "v": [[0.0, 0.0]], "i": [[0.0, 0.0]], "o": [[0.0, 0.0]], "c": true } } },
+                    { "ty": "fl", "c": { "k": [0.1137, 0.1137, 0.1059, 1.0] }, "o": { "k": 100.0 } },
+                    { "ty": "tr", "p": { "k": [0.0, 0.0, 0.0] } }
+                ]
+            }
+        ]));
+        let content = ShapeContent::from_layer(&v, 30.0);
+        let g = &content.groups[0];
+        // Three paint passes: (sh1+sh2, fl_dark), (sh3, fl_teal),
+        // (sh4, fl_dark). Without the split the last-writer-wins
+        // parser collapsed everything onto a single dark fill.
+        assert_eq!(g.paints.len(), 3, "three fill segments → three passes");
+        assert_eq!(g.paints[0].geometries.len(), 2);
+        assert_eq!(g.paints[1].geometries.len(), 1);
+        assert_eq!(g.paints[2].geometries.len(), 1);
+        let first_color = match &g.paints[0].fill.as_ref().unwrap().paint {
+            Paint::Solid(c) => sample_paint_color(c, &g.paints[0].fill.as_ref().unwrap().opacity, 0.0),
+            _ => panic!("expected solid fill"),
+        };
+        let middle_color = match &g.paints[1].fill.as_ref().unwrap().paint {
+            Paint::Solid(c) => sample_paint_color(c, &g.paints[1].fill.as_ref().unwrap().opacity, 0.0),
+            _ => panic!("expected solid fill"),
+        };
+        assert!((first_color.r - 0.1137).abs() < 1e-3, "first pass dark");
+        assert!((middle_color.g - 0.7098).abs() < 1e-3, "middle pass teal");
     }
 
     #[test]
@@ -1609,9 +1819,9 @@ mod tests {
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
         let g = &content.groups[0];
-        assert_eq!(g.geometries.len(), 1);
-        assert!(g.stroke.is_some());
-        let s = g.stroke.as_ref().unwrap();
+        assert_eq!(g.all_geometries().len(), 1);
+        assert!(g.first_stroke().is_some());
+        let s = g.first_stroke().unwrap();
         assert!((s.width.sample(0.0) - 4.0).abs() < 1e-5);
     }
 
@@ -1639,7 +1849,7 @@ mod tests {
         let content = ShapeContent::from_layer(&v, 60.0);
         assert_eq!(content.groups.len(), 1);
         assert_eq!(content.groups[0].children.len(), 1);
-        assert_eq!(content.groups[0].children[0].geometries.len(), 1);
+        assert_eq!(content.groups[0].children[0].all_geometries().len(), 1);
     }
 
     #[test]
@@ -1659,7 +1869,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        assert_eq!(content.groups[0].geometries.len(), 1, "rect should still parse");
+        assert_eq!(content.groups[0].all_geometries().len(), 1, "rect should still parse");
     }
 
     #[test]
@@ -1867,8 +2077,8 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        assert_eq!(content.groups[0].geometries.len(), 1);
-        match &content.groups[0].geometries[0] {
+        assert_eq!(content.groups[0].all_geometries().len(), 1);
+        match &*content.groups[0].all_geometries()[0] {
             Geometry::Path(AnimatedPath::Static(shape)) => {
                 assert_eq!(shape.vertices.len(), 3);
                 assert!(shape.closed);
@@ -1913,7 +2123,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        match &content.groups[0].geometries[0] {
+        match &*content.groups[0].all_geometries()[0] {
             Geometry::Path(AnimatedPath::Keyframed(keys)) => {
                 assert_eq!(keys.len(), 2);
                 assert_eq!(keys[0].value.vertices[0], [0.0, 0.0]);
@@ -1964,7 +2174,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let Geometry::Path(path) = &content.groups[0].geometries[0] else {
+        let Geometry::Path(path) = &*content.groups[0].all_geometries()[0] else {
             panic!("expected path");
         };
         let mid = path.sample(0.5);
@@ -2008,7 +2218,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let fill = content.groups[0].fill.as_ref().expect("gradient fill parsed");
+        let fill = content.groups[0].first_fill().expect("gradient fill parsed");
         let Paint::LinearGradient { stops, .. } = &fill.paint else {
             panic!("expected linear gradient, got {:?}", fill.paint);
         };
@@ -2050,7 +2260,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let stroke = content.groups[0].stroke.as_ref().expect("gradient stroke parsed");
+        let stroke = content.groups[0].first_stroke().expect("gradient stroke parsed");
         assert!(matches!(stroke.paint, Paint::RadialGradient { .. }));
         assert!((stroke.width.sample(0.0) - 3.0).abs() < 1e-5);
     }
@@ -2080,7 +2290,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        let stroke = content.groups[0].first_stroke().unwrap();
         assert_eq!(stroke.cap, LineCap::Round);
         assert_eq!(stroke.join, LineJoin::Bevel);
         assert!((stroke.miter_limit - 10.0).abs() < 1e-5);
@@ -2113,7 +2323,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        let stroke = content.groups[0].first_stroke().unwrap();
         assert_eq!(stroke.dash_pattern, vec![10.0, 5.0]);
         assert!((stroke.dash_offset.sample(0.0) - 3.0).abs() < 1e-5);
     }
@@ -2150,7 +2360,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        let stroke = content.groups[0].first_stroke().unwrap();
         assert_eq!(stroke.dash_pattern, vec![10.0, 5.0, 20.0, 3.0]);
     }
 
@@ -2176,7 +2386,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let stroke = content.groups[0].stroke.as_ref().unwrap();
+        let stroke = content.groups[0].first_stroke().unwrap();
         assert_eq!(stroke.cap, LineCap::Butt);
         assert_eq!(stroke.join, LineJoin::Miter);
         assert!((stroke.miter_limit - 4.0).abs() < 1e-5);
@@ -2221,7 +2431,7 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let fill = content.groups[0].fill.as_ref().unwrap();
+        let fill = content.groups[0].first_fill().unwrap();
         let Paint::LinearGradient { stops, .. } = &fill.paint else {
             panic!("expected linear gradient");
         };

@@ -81,3 +81,21 @@ dotlottie = ["dep:zip"]
 # JPEG / base64 decoding. Callers that only load vector-only
 # Lotties can disable this to shed the image-decoding deps.
 images = ["dep:blinc_image"]
+
+# Dev-only deps for the runnable examples under `examples/`.
+# `blinc_core` / `blinc_canvas_kit` / `blinc_image` come in through
+# `[dependencies]` + the `[patch]` block; only the extras examples
+# actually need go here. `blinc_app` is the windowing host
+# (examples open a real window) and `blinc_layout` carries the
+# `div()` / `ElementBuilder` surface the examples build UI with.
+# Published distributions should exclude `examples/` (cargo refuses
+# to package path dev-deps otherwise).
+[dev-dependencies]
+blinc_app = { path = "../../crates/blinc_app" }
+blinc_layout = { path = "../../crates/blinc_layout" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[[example]]
+name = "sandy_loading"
+path = "examples/sandy_loading.rs"

@@ -1796,6 +1796,24 @@ pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
     dc.pop_transform();
 }
 
+/// Same as [`push_layer_transform`] but skips the opacity push, used
+/// when the layer's render is already inside a `push_layer`/`pop_layer`
+/// offscreen composite that holds the opacity. Pushing again would
+/// multiply it twice.
+pub(crate) fn push_layer_transform_no_opacity(dc: &mut dyn DrawContext, xform: &SampledTransform) {
+    dc.push_transform(Transform::translate(xform.position[0], xform.position[1]));
+    dc.push_transform(Transform::rotate(xform.rotation));
+    dc.push_transform(Transform::scale(xform.scale[0], xform.scale[1]));
+    dc.push_transform(Transform::translate(-xform.anchor[0], -xform.anchor[1]));
+}
+
+pub(crate) fn pop_layer_transform_no_opacity(dc: &mut dyn DrawContext) {
+    dc.pop_transform();
+    dc.pop_transform();
+    dc.pop_transform();
+    dc.pop_transform();
+}
+
 /// Render a Lottie text document into `dc`. Splits the text on
 /// newlines so multi-line documents honour line height; positions
 /// each line's baseline at `line_index × line_height` from the
@@ -1828,11 +1846,8 @@ fn render_text_layer(dc: &mut dyn DrawContext, doc: &TextDoc) {
 }
 
 /// Push a parent's transform onto the stack without its opacity.
-/// Lottie / After Effects parent transforms compose spatially
-/// (position · rotation · scale · anchor) but do not propagate
-/// opacity — each layer gates its own fade independently. The
-/// caller matches each call with exactly one
-/// [`pop_parent_transform`].
+/// Parent transforms compose spatially but opacity stays per-layer
+/// per the Lottie spec.
 pub(crate) fn push_parent_transform(dc: &mut dyn DrawContext, xform: &SampledTransform) {
     dc.push_transform(Transform::translate(xform.position[0], xform.position[1]));
     dc.push_transform(Transform::rotate(xform.rotation));
@@ -3145,5 +3160,39 @@ mod tests {
         });
         let layer = Layer::from_value(&v, 60.0);
         assert!(layer.masks.is_empty());
+    }
+
+    #[test]
+    fn static_layer_opacity_scalar_parses_to_0_to_1() {
+        // Lottie encodes translucent layers as `"o": {"a": 0, "k": 50}`
+        // (50%), where `k` is a plain number — not wrapped in an array.
+        // Sandy_Loading's `Glass Out Outlines` uses exactly this form
+        // and renders fully opaque in this demo unless the scalar-k
+        // branch of `parse_animated_scalar` resolves it correctly and
+        // the `/100` mapping in `TransformSpec::from_value` brings it
+        // into 0..=1 range.
+        let v = json!({
+            "ty": 4, "ip": 0, "op": 150,
+            "ks": { "o": { "a": 0, "k": 50 } },
+            "shapes": []
+        });
+        let layer = Layer::from_value(&v, 30.0);
+        let sampled = layer.transform.sample(0.0);
+        assert!(
+            (sampled.opacity - 0.5).abs() < 1e-5,
+            "expected layer opacity = 0.5, got {}",
+            sampled.opacity
+        );
+
+        // Also test the 20%-as-array form BG Outlines uses (equivalent
+        // behaviour but different JSON shape some exporters emit).
+        let v = json!({
+            "ty": 4, "ip": 0, "op": 150,
+            "ks": { "o": { "a": 0, "k": [20] } },
+            "shapes": []
+        });
+        let layer = Layer::from_value(&v, 30.0);
+        let sampled = layer.transform.sample(0.0);
+        assert!((sampled.opacity - 0.2).abs() < 1e-5);
     }
 }
