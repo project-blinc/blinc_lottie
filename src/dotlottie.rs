@@ -160,17 +160,18 @@ pub(crate) fn extract(src: &[u8]) -> Result<DotLottieArchive, Error> {
         .ok_or_else(|| Error::Archive("manifest.json missing from archive root".to_string()))?;
     let manifest: Manifest = serde_json::from_slice(manifest_bytes)?;
 
-    // Pull every declared animation. An animation listed in the
-    // manifest but missing its `a/<id>.json` file is a genuine
-    // archive error — the spec requires every `animations[]` entry
-    // to have a corresponding file.
+    // Pull every declared animation. dotLottie 2.0 stores bodies at
+    // `a/<id>.json`; 1.x archives (still in circulation from older
+    // LottieFiles exports) use `animations/<id>.json`. Accept either
+    // so both vintages parse. Missing-from-both is the real error.
     let mut animations: HashMap<String, Vec<u8>> = HashMap::new();
     for meta in &manifest.animations {
-        let path = format!("a/{}.json", meta.id);
-        let bytes = files.get(&path).ok_or_else(|| {
+        let path_v2 = format!("a/{}.json", meta.id);
+        let path_v1 = format!("animations/{}.json", meta.id);
+        let bytes = files.get(&path_v2).or_else(|| files.get(&path_v1)).ok_or_else(|| {
             Error::Archive(format!(
-                "animation '{}' declared in manifest but `{}` missing",
-                meta.id, path
+                "animation '{}' declared in manifest but neither `{}` nor `{}` present",
+                meta.id, path_v2, path_v1
             ))
         })?;
         animations.insert(meta.id.clone(), bytes.clone());
