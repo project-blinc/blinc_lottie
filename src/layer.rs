@@ -1173,13 +1173,32 @@ impl Layer {
                 // Render child layers in Lottie's back-to-front
                 // convention. Parent chains are scoped to this
                 // precomp's layer vec (resolved at parse).
+                //
+                // Matte handling (`is_matte_source` skip + track-matte
+                // clip) mirrors the top-level walk in
+                // `crate::render_layer_stack`. Without it, a
+                // `td`-marked matte source (e.g. Coffee.lottie's
+                // `mask` layer) would render its fill standalone and
+                // the matted layer would paint unclipped — the visible
+                // bug where the mask's green body filled the whole
+                // cup shape and the liquid precomp showed on top.
                 for (i, child) in layers.iter().enumerate().rev() {
+                    if child.is_matte_source {
+                        continue;
+                    }
+
                     for &anc_idx in &child.parent_chain {
                         let anc_xform = layers[anc_idx].transform.sample(child_t);
                         push_parent_transform(dc, &anc_xform);
                     }
-                    let _ = i;
+
+                    let matte_pushed = crate::push_matte_clip(dc, layers, i, child_t);
+
                     child.render(dc, child_t);
+
+                    if matte_pushed {
+                        dc.pop_clip();
+                    }
                     for _ in 0..child.parent_chain.len() {
                         pop_parent_transform(dc);
                     }
@@ -1951,8 +1970,17 @@ pub(crate) fn resolve_matte_pairs(layers: &mut [Layer]) {
     let n = layers.len();
     for i in 0..n {
         if layers[i].track_matte.is_active() {
-            if i + 1 < n {
-                layers[i + 1].is_matte_source = true;
+            if i > 0 {
+                // Lottie convention (per lottie-docs and lottie-web):
+                // the matte source for a layer with `tt` is the
+                // PREVIOUS layer in the array. In After Effects that
+                // corresponds to the layer sitting ABOVE the matted
+                // layer in the timeline, which exports EARLIER in the
+                // JSON layer array (layers render back-to-front, so
+                // earlier = in front). Flipping this to N-1 is what
+                // makes `td`-marked matte sources line up with the
+                // matted layer's `tt` nomination.
+                layers[i - 1].is_matte_source = true;
             } else {
                 // Dangling `tt` — drop it so downstream render
                 // doesn't look for an absent matte layer.

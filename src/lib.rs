@@ -687,7 +687,12 @@ fn render_layer_stack(
 /// matte source's parent chain + own transform so the clip lands
 /// in source space (the same space the matted layer's own paint
 /// uses after its transforms are pushed).
-fn push_matte_clip(
+///
+/// `pub(crate)` so precomp rendering (`Layer::render`'s `Precomp`
+/// arm in `layer.rs`) can reuse the same pairing rule — otherwise
+/// matte sources and matted layers inside precomps would diverge
+/// from the top-level walk in `render_layer_stack`.
+pub(crate) fn push_matte_clip(
     dc: &mut dyn blinc_core::DrawContext,
     layers: &[Layer],
     matted_idx: usize,
@@ -698,9 +703,13 @@ fn push_matte_clip(
     if !matted.track_matte.is_active() {
         return false;
     }
-    let Some(matte) = layers.get(matted_idx + 1) else {
+    // The matte source sits at N-1 per Lottie's array convention —
+    // earlier in the array = on top in AE = rendered in front. See
+    // `layer::resolve_matte_pairs` for the full rationale.
+    if matted_idx == 0 {
         return false;
-    };
+    }
+    let matte = &layers[matted_idx - 1];
     let Some(local_path) = matte.extract_matte_path(scene_t) else {
         return false;
     };
@@ -717,57 +726,165 @@ fn push_matte_clip(
     let matte_xform = matte.transform.sample(scene_t);
     world = layer::multiply_affines(&world, &layer::layer_local_affine(&matte_xform));
 
-    // Transform every path command through the composed affine.
-    let commands: Vec<_> = local_path
-        .commands()
-        .iter()
-        .map(|cmd| transform_matte_command(cmd, &world))
-        .collect();
-    let transformed = blinc_core::draw::Path::from_commands(commands);
-
-    dc.push_clip(ClipShape::Path(transformed));
+    // Flatten the matte path into a polygon in sketch-local space.
+    // `ClipShape::Path` is a documented no-op in the GPU renderer
+    // (paint.rs falls through to "no clip" on Path variants), so a
+    // path-typed clip silently disappears — which is why the matte
+    // never took effect before and the matted layer painted as if
+    // unclipped. `ClipShape::Polygon` goes through the aux-data
+    // storage buffer + shader winding-number test, which is
+    // implemented. Curves are subdivided via De Casteljau; `Close`
+    // jumps back to the subpath's start.
+    let vertices = flatten_path_to_polygon(&local_path, &world);
+    if vertices.len() < 3 {
+        return false;
+    }
+    dc.push_clip(ClipShape::Polygon(vertices));
     true
 }
 
-fn transform_matte_command(
-    cmd: &blinc_core::draw::PathCommand,
+/// Walk `path` and emit one `Point` per segment endpoint, subdividing
+/// quadratic and cubic beziers into line approximations. Each vertex
+/// is pre-transformed through `affine`; the returned polygon is in
+/// the coordinate frame `affine` targets. `ArcTo` isn't produced by
+/// Lottie shape content in practice so the arc segment contributes
+/// only its endpoint (same fallback the CSS clip-path flattener uses).
+fn flatten_path_to_polygon(
+    path: &blinc_core::draw::Path,
     affine: &blinc_core::layer::Affine2D,
-) -> blinc_core::draw::PathCommand {
+) -> Vec<blinc_core::layer::Point> {
     use blinc_core::draw::PathCommand;
     use blinc_core::layer::Point;
     let [a, b, c, d, tx, ty] = affine.elements;
-    let apply = |p: Point| Point::new(a * p.x + c * p.y + tx, b * p.x + d * p.y + ty);
-    match cmd {
-        PathCommand::MoveTo(p) => PathCommand::MoveTo(apply(*p)),
-        PathCommand::LineTo(p) => PathCommand::LineTo(apply(*p)),
-        PathCommand::QuadTo { control, end } => PathCommand::QuadTo {
-            control: apply(*control),
-            end: apply(*end),
-        },
-        PathCommand::CubicTo {
-            control1,
-            control2,
-            end,
-        } => PathCommand::CubicTo {
-            control1: apply(*control1),
-            control2: apply(*control2),
-            end: apply(*end),
-        },
-        PathCommand::ArcTo {
-            radii,
-            rotation,
-            large_arc,
-            sweep,
-            end,
-        } => PathCommand::ArcTo {
-            radii: *radii,
-            rotation: *rotation,
-            large_arc: *large_arc,
-            sweep: *sweep,
-            end: apply(*end),
-        },
-        PathCommand::Close => PathCommand::Close,
+    let apply = |x: f32, y: f32| Point::new(a * x + c * y + tx, b * x + d * y + ty);
+
+    let mut verts: Vec<Point> = Vec::new();
+    let mut cx = 0.0_f32;
+    let mut cy = 0.0_f32;
+    let mut start_x = 0.0_f32;
+    let mut start_y = 0.0_f32;
+
+    for cmd in path.commands() {
+        match cmd {
+            PathCommand::MoveTo(p) => {
+                cx = p.x;
+                cy = p.y;
+                start_x = cx;
+                start_y = cy;
+                verts.push(apply(cx, cy));
+            }
+            PathCommand::LineTo(p) => {
+                cx = p.x;
+                cy = p.y;
+                verts.push(apply(cx, cy));
+            }
+            PathCommand::QuadTo { control, end } => {
+                subdivide_quad(&mut verts, &apply, cx, cy, control.x, control.y, end.x, end.y, 0);
+                cx = end.x;
+                cy = end.y;
+            }
+            PathCommand::CubicTo { control1, control2, end } => {
+                subdivide_cubic(
+                    &mut verts, &apply, cx, cy, control1.x, control1.y, control2.x, control2.y,
+                    end.x, end.y, 0,
+                );
+                cx = end.x;
+                cy = end.y;
+            }
+            PathCommand::ArcTo { end, .. } => {
+                cx = end.x;
+                cy = end.y;
+                verts.push(apply(cx, cy));
+            }
+            PathCommand::Close => {
+                cx = start_x;
+                cy = start_y;
+                verts.push(apply(cx, cy));
+            }
+        }
     }
+    verts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subdivide_cubic(
+    out: &mut Vec<blinc_core::layer::Point>,
+    apply: &impl Fn(f32, f32) -> blinc_core::layer::Point,
+    x0: f32, y0: f32,
+    x1: f32, y1: f32,
+    x2: f32, y2: f32,
+    x3: f32, y3: f32,
+    depth: u32,
+) {
+    const MAX_DEPTH: u32 = 6;
+    const TOLERANCE: f32 = 1.0;
+
+    if depth >= MAX_DEPTH {
+        out.push(apply(x3, y3));
+        return;
+    }
+    let dx = x3 - x0;
+    let dy = y3 - y0;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 0.0001 {
+        out.push(apply(x3, y3));
+        return;
+    }
+    let d1 = ((x1 - x0) * dy - (y1 - y0) * dx).abs();
+    let d2 = ((x2 - x0) * dy - (y2 - y0) * dx).abs();
+    let max_dev = (d1 + d2) / len_sq.sqrt();
+    if max_dev < TOLERANCE {
+        out.push(apply(x3, y3));
+        return;
+    }
+
+    let m01x = (x0 + x1) * 0.5;
+    let m01y = (y0 + y1) * 0.5;
+    let m12x = (x1 + x2) * 0.5;
+    let m12y = (y1 + y2) * 0.5;
+    let m23x = (x2 + x3) * 0.5;
+    let m23y = (y2 + y3) * 0.5;
+    let m012x = (m01x + m12x) * 0.5;
+    let m012y = (m01y + m12y) * 0.5;
+    let m123x = (m12x + m23x) * 0.5;
+    let m123y = (m12y + m23y) * 0.5;
+    let mx = (m012x + m123x) * 0.5;
+    let my = (m012y + m123y) * 0.5;
+
+    subdivide_cubic(out, apply, x0, y0, m01x, m01y, m012x, m012y, mx, my, depth + 1);
+    subdivide_cubic(out, apply, mx, my, m123x, m123y, m23x, m23y, x3, y3, depth + 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subdivide_quad(
+    out: &mut Vec<blinc_core::layer::Point>,
+    apply: &impl Fn(f32, f32) -> blinc_core::layer::Point,
+    x0: f32, y0: f32,
+    qx: f32, qy: f32,
+    x2: f32, y2: f32,
+    depth: u32,
+) {
+    const MAX_DEPTH: u32 = 6;
+    const TOLERANCE: f32 = 1.0;
+    if depth >= MAX_DEPTH {
+        out.push(apply(x2, y2));
+        return;
+    }
+    let mid_x = (x0 + x2) * 0.5;
+    let mid_y = (y0 + y2) * 0.5;
+    let dev = ((qx - mid_x).powi(2) + (qy - mid_y).powi(2)).sqrt();
+    if dev < TOLERANCE {
+        out.push(apply(x2, y2));
+        return;
+    }
+    let m01x = (x0 + qx) * 0.5;
+    let m01y = (y0 + qy) * 0.5;
+    let m12x = (qx + x2) * 0.5;
+    let m12y = (qy + y2) * 0.5;
+    let mx = (m01x + m12x) * 0.5;
+    let my = (m01y + m12y) * 0.5;
+    subdivide_quad(out, apply, x0, y0, m01x, m01y, mx, my, depth + 1);
+    subdivide_quad(out, apply, mx, my, m12x, m12y, x2, y2, depth + 1);
 }
 
 /// Should `layers[i]` skip its content render because its
