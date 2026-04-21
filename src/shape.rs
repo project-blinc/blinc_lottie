@@ -595,11 +595,32 @@ impl ShapeGroup {
 
         // Sample the trim window once per frame so every paint pass
         // in the group sees the same cut.
-        let trim_window = self
-            .trim
-            .as_ref()
-            .map(|tm| sample_trim_window(tm, t))
-            .filter(|window| window.has_visible_range());
+        //
+        // Three outcomes the paint passes care about:
+        //  - no trim configured → render the geometry unchanged;
+        //  - trim configured but the window is full-range (identity)
+        //    → also render unchanged;
+        //  - trim configured but the window is zero-length
+        //    (start ≈ end) → render *nothing*, because the paint is
+        //    in its trim-out / "disappeared" state.
+        // An animated trim that starts at `end < start` and animates
+        // both to the same value uses the zero-length window as the
+        // final "gone" frame (the shooting-star sweep pattern). The
+        // old filter dropped every non-partial window to `None`,
+        // which collapsed the empty case onto the identity case and
+        // painted a stale static path after the sweep finished —
+        // visible as three stuck shooting-star trails on the Dark
+        // Mode scene.
+        let raw_trim_window = self.trim.as_ref().map(|tm| sample_trim_window(tm, t));
+        if let Some(window) = raw_trim_window {
+            if window.is_empty() {
+                if pushed {
+                    pop_layer_transform(dc);
+                }
+                return;
+            }
+        }
+        let trim_window = raw_trim_window.filter(|window| window.has_visible_range());
         let trim_mode = self.trim.as_ref().map(|tm| tm.mode);
 
         // Lottie renders items in `it[]` in REVERSE author order —
@@ -752,25 +773,40 @@ struct TrimWindow {
 }
 
 impl TrimWindow {
-    fn has_visible_range(&self) -> bool {
-        // Full-range trim (start ≈ 0, end ≈ 1) is a no-op; a degenerate
-        // zero-length trim (start == end) paints nothing. Both get
-        // fast-pathed here to save the flatten + walk cost.
-        //
-        // When the offset rotates the window across the 0/1 boundary,
-        // `sample_trim_window` produces `start > end` to signal a
-        // wrapped span. `apply_trim` handles that with a two-slice
-        // emission, so the span here is `(1 - start) + end` rather
-        // than the negative `end - start` of the raw subtraction —
-        // otherwise ~20% of a full-rotation spinner animation would
-        // take the "no visible range" fast-path and render the whole
-        // unclipped path (seen as a full loading ring on Sandy_Loading).
-        let span = if self.end >= self.start {
+    /// Arc-length span covered by the window, respecting the wrap
+    /// through 1.0 that an offset can introduce when `end < start`.
+    fn span(&self) -> f32 {
+        if self.end >= self.start {
             self.end - self.start
         } else {
             (1.0 - self.start) + self.end
-        };
+        }
+    }
+
+    /// True when the window covers more than a degenerate sliver and
+    /// less than the whole path — i.e. `apply_trim` would produce a
+    /// non-empty, non-identity slice. Full-range trims are
+    /// fast-pathed to the identity branch (render everything
+    /// unmodified); empty-range trims are fast-pathed to the empty
+    /// branch (render nothing). Both get short-circuited out of the
+    /// flatten + walk cost here.
+    fn has_visible_range(&self) -> bool {
+        let span = self.span();
         span > 1e-6 && span < 1.0 - 1e-6
+    }
+
+    /// True when the window is degenerate — zero-length arc slice
+    /// — which means the paint pass should emit no geometry at all.
+    /// Distinct from `has_visible_range`: a full-range trim also
+    /// fails `has_visible_range` but SHOULD still render the path
+    /// (unmodified), whereas an empty-range trim should render
+    /// nothing. Without this split the caller conflated the two
+    /// cases and rendered the unclipped static path in both, which
+    /// broke trim-out animations like shooting-star sweeps (authored
+    /// with `start == end == 100%` as the "done / disappeared" tail
+    /// state).
+    fn is_empty(&self) -> bool {
+        self.span() <= 1e-6
     }
 
     fn is_identity(&self) -> bool {
