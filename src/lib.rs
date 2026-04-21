@@ -687,38 +687,45 @@ fn render_layer_stack(
             continue;
         }
 
+        // Push the matte clip BEFORE the matted layer's parent
+        // chain, not after. `push_matte_clip` pre-transforms the
+        // matte's path by the matte's own full parent×own chain so
+        // the vertices handed to `push_clip` already live in the
+        // same outer-pipeline frame the matted layer's final screen
+        // coords will be in. If we push the matted layer's parent
+        // chain first, `push_clip`'s current-transform capture
+        // re-applies that parent chain on top — doubling it up
+        // whenever the matte and matted layers have different
+        // parent chains (common in Lottie scenes like `Dark Mode
+        // Button.lottie` where the `Sphear Matt` has no parent but
+        // the `Crease` layer it gates is parented to `Sphear`).
+        // Pushing the clip first keeps the capture transform at
+        // just the outer pipeline so the polygon lands where the
+        // matte's rendered position should be.
+        let matte_pushed = push_matte_clip(dc, layers, i, scene_t);
+
         for &anc_idx in &layer.parent_chain {
             let anc_xform = layers[anc_idx].transform.sample(scene_t);
             layer::push_parent_transform(dc, &anc_xform);
         }
 
-        // If this layer nominates a matte source, extract its
-        // clip path (transformed through the matte source's own
-        // world-space affine), push it as a `ClipShape::Path`,
-        // then pop after the matted render. The current pragmatic
-        // implementation collapses Alpha / AlphaInverted / Luma /
-        // LumaInverted to Alpha — the matte's silhouette clips the
-        // matted content. Inverted / Luma modes require offscreen
-        // composite to honour faithfully; tracked as follow-up.
-        let matte_pushed = push_matte_clip(dc, layers, i, scene_t);
-
         if cull_layer(layers, i, local_root, dest, scene_t) {
-            if matte_pushed {
-                dc.pop_clip();
-            }
             for _ in 0..layer.parent_chain.len() {
                 layer::pop_parent_transform(dc);
+            }
+            if matte_pushed {
+                dc.pop_clip();
             }
             continue;
         }
 
         layer.render(dc, scene_t);
 
-        if matte_pushed {
-            dc.pop_clip();
-        }
         for _ in 0..layer.parent_chain.len() {
             layer::pop_parent_transform(dc);
+        }
+        if matte_pushed {
+            dc.pop_clip();
         }
     }
 }
@@ -781,9 +788,47 @@ pub(crate) fn push_matte_clip(
     if vertices.len() < 3 {
         return false;
     }
+
+    // Diagnostic overlay: when `BLINC_LOTTIE_DEBUG_MATTES=1` is set,
+    // paint a thin red outline where the matte polygon *should* land
+    // on screen BEFORE we push the clip (so the stroke itself
+    // doesn't get clipped by the matte). Drawing through
+    // `stroke_path` routes each segment through the normal mesh-
+    // primitive pipeline so the outline honours the surrounding
+    // transform + clip stack the same way real layer content would.
+    // Lets us visually confirm whether the matte polygon aligns
+    // with the matted layer's rendered pixels — the single biggest
+    // unknown when a matted layer like Crease appears to escape its
+    // matte (or when an `SpearMatt`-gated layer paints through an
+    // outline that shouldn't exist).
+    if *DEBUG_MATTES {
+        use blinc_core::draw::{Path, PathCommand, Stroke};
+        use blinc_core::layer::Brush;
+        let mut cmds: Vec<PathCommand> = Vec::with_capacity(vertices.len() + 1);
+        cmds.push(PathCommand::MoveTo(vertices[0]));
+        for v in vertices.iter().skip(1) {
+            cmds.push(PathCommand::LineTo(*v));
+        }
+        cmds.push(PathCommand::Close);
+        let outline = Path::from_commands(cmds);
+        let stroke = Stroke::new(1.5);
+        let debug_color = blinc_core::Color::rgba(1.0, 0.2, 0.2, 0.9);
+        dc.stroke_path(&outline, &stroke, Brush::Solid(debug_color));
+    }
+
     dc.push_clip(ClipShape::Polygon(vertices));
     true
 }
+
+/// Read-once env-var toggle. `BLINC_LOTTIE_DEBUG_MATTES=1` turns on
+/// the red-outline overlay that marks every matte polygon in the
+/// scene — easiest way to see whether a matte's post-transform
+/// polygon actually overlaps the matted layer's rendered pixels.
+static DEBUG_MATTES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("BLINC_LOTTIE_DEBUG_MATTES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
 
 /// Walk `path` and emit one `Point` per segment endpoint, subdividing
 /// quadratic and cubic beziers into line approximations. Each vertex

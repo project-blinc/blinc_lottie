@@ -1187,20 +1187,27 @@ impl Layer {
                         continue;
                     }
 
+                    // Matte clip first, then parent chain — see
+                    // `render_layer_stack` for the rationale: the
+                    // matte's polygon is pre-transformed by the
+                    // matte's own chain, so the matted layer's
+                    // parent chain must not be on `dc` at push
+                    // time or `push_clip`'s current-transform
+                    // capture double-applies it.
+                    let matte_pushed = crate::push_matte_clip(dc, layers, i, child_t);
+
                     for &anc_idx in &child.parent_chain {
                         let anc_xform = layers[anc_idx].transform.sample(child_t);
                         push_parent_transform(dc, &anc_xform);
                     }
 
-                    let matte_pushed = crate::push_matte_clip(dc, layers, i, child_t);
-
                     child.render(dc, child_t);
 
-                    if matte_pushed {
-                        dc.pop_clip();
-                    }
                     for _ in 0..child.parent_chain.len() {
                         pop_parent_transform(dc);
+                    }
+                    if matte_pushed {
+                        dc.pop_clip();
                     }
                 }
 
