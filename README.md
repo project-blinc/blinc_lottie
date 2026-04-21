@@ -26,6 +26,8 @@ fn build() -> Div {
 }
 ```
 
+![Blinc Lottie Player](ScreenRecording2026-04-21at02.52.54-ezgif.com-video-to-gif-converter.gif)
+
 ## Status
 
 Early skeleton — loads JSON, exposes metadata. Rendering is stubbed: `draw_at`

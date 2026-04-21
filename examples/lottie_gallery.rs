@@ -34,6 +34,7 @@ enum AssetSource {
 struct Asset {
     name: &'static str,
     source: AssetSource,
+    author: &'static str,
 }
 
 /// Cards rendered in the gallery, in display order. Add entries here
@@ -43,10 +44,22 @@ const ASSETS: &[Asset] = &[
     Asset {
         name: "Coffee (.lottie)",
         source: AssetSource::DotLottie(include_bytes!("assets/Coffee.lottie")),
+        author: "Aram Verdoyan",
     },
     Asset {
         name: "Sandy Loading (JSON)",
         source: AssetSource::Json(include_str!("assets/Sandy_Loading.json")),
+        author: "Parsa Navaei",
+    },
+     Asset {
+        name: "Lodader Cat (.lottie)",
+        source: AssetSource::DotLottie(include_bytes!("assets/Loader cat.lottie")),
+        author: "Diane Picchiottino",
+    },
+     Asset {
+        name: "Dark Mode Button (.lottie)",
+        source: AssetSource::DotLottie(include_bytes!("assets/Dark Mode Button.lottie")),
+        author: "Mohammad Turk",
     },
 ];
 
@@ -157,15 +170,31 @@ fn build_card_by_idx(idx: usize, asset: &'static Asset) -> Div {
         .flex_col()
         .w(CARD_WIDTH)
         .h_fit()
+        .overflow_clip()
         .gap_px(8.0)
         .p_px(12.0)
-        .overflow_clip()
         .bg(Color::rgba(0.13, 0.13, 0.17, 1.0))
         .rounded(12.0)
         .child(
-            text(asset.name)
-                .size(13.0)
-                .color(Color::rgba(0.85, 0.85, 0.9, 1.0)),
+            // Wrap the title in a fixed-height row so taffy doesn't
+            // measure the text against `MinContent` and report back
+            // a multi-line height when the title happens to be
+            // longer than Blinc's text measurer expects on a
+            // first-pass width probe. Locking the slot to one
+            // line-box keeps both cards at identical content height
+            // regardless of title text length.
+            div()
+                .w_full()
+                .h(36.0)
+                .gap_px(4.0)
+                .overflow_clip()
+                .flex_col()
+                .child(
+                    text(asset.name)
+                        .size(13.0)
+                        .color(Color::rgba(0.85, 0.85, 0.9, 1.0)),
+                ).child(text(format!("by {}", asset.author)).size(11.0)
+                        .color(Color::rgba(0.85, 0.85, 0.9, 1.0))),
         )
         .child(
             div()
@@ -173,7 +202,6 @@ fn build_card_by_idx(idx: usize, asset: &'static Asset) -> Div {
                 .h(CANVAS_SIZE)
                 .bg(Color::WHITE)
                 .rounded(8.0)
-                .overflow_clip()
                 .child(sketch(
                     &format!("card_{idx}_sketch"),
                     CardSketch {
@@ -266,10 +294,10 @@ fn build_controls(
 
             div()
                 .flex_row()
-                .gap_px(12.0)
+                .gap_px(4.0)
                 .items_center()
-                .h(32.0)
-                
+                .h(28.0)
+                .id(format!("card_{idx}_controls"))
                 .child(play_btn)
                 .child(seek_track)
         })
@@ -287,18 +315,17 @@ pub fn build_ui(ctx: &mut WindowedContext) -> impl ElementBuilder {
         .collect();
     let bg = Color::rgba(0.08, 0.08, 0.1, 1.0);
 
-    div().w(w).h(h).overflow_y_scroll().child(
-        div()
-            .w_full()
-            .h_fit()
-            .flex_row()
-            .justify_center()
+    div()
+            .w(w)
+            .h(h)
+            .overflow_y_scroll()
             .id("gallery_root_base")
             .bg(bg)
             .p_px(20.0)
-            .gap_px(20.0)
-            .children(cards),
-    )
+            .gap_px(10.0)
+            .flex_wrap()
+            .justify_center()
+            .children(cards)
 }
 
 fn main() -> Result<()> {
