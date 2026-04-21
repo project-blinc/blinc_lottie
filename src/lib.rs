@@ -760,6 +760,25 @@ pub(crate) fn push_matte_clip(
     }
     let matte = &layers[matted_idx - 1];
     let Some(local_path) = matte.extract_matte_path(scene_t) else {
+        if *DEBUG_MATTES {
+            eprintln!(
+                "[lottie] matte skipped (no path): matted_ind={:?} idx={} tt={:?} matte_ind={:?} matte_kind={}",
+                matted.ind,
+                matted_idx,
+                matted.track_matte,
+                matte.ind,
+                match &matte.kind {
+                    layer::LayerKind::Shape(_) => "Shape",
+                    layer::LayerKind::Solid { .. } => "Solid",
+                    layer::LayerKind::Precomp { .. } => "Precomp",
+                    layer::LayerKind::Null => "Null",
+                    layer::LayerKind::Text(_) => "Text",
+                    #[cfg(feature = "images")]
+                    layer::LayerKind::Image(_) => "Image",
+                    layer::LayerKind::Unknown => "Unknown",
+                }
+            );
+        }
         return false;
     };
 
@@ -786,7 +805,33 @@ pub(crate) fn push_matte_clip(
     // jumps back to the subpath's start.
     let vertices = flatten_path_to_polygon(&local_path, &world);
     if vertices.len() < 3 {
+        if *DEBUG_MATTES {
+            eprintln!(
+                "[lottie] matte skipped (polygon too small): matted_ind={:?} idx={} verts={}",
+                matted.ind,
+                matted_idx,
+                vertices.len()
+            );
+        }
         return false;
+    }
+    if *DEBUG_MATTES {
+        if let (Some(first), Some(last)) = (vertices.first(), vertices.last()) {
+            let min_x = vertices.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+            let min_y = vertices.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+            let max_x = vertices.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+            let max_y = vertices.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "[lottie] matte push: matted_ind={:?} idx={} matte_ind={:?} verts={} bbox=({:.1},{:.1})->({:.1},{:.1}) first=({:.1},{:.1}) last=({:.1},{:.1})",
+                matted.ind,
+                matted_idx,
+                matte.ind,
+                vertices.len(),
+                min_x, min_y, max_x, max_y,
+                first.x, first.y,
+                last.x, last.y,
+            );
+        }
     }
 
     // Diagnostic overlay: when `BLINC_LOTTIE_DEBUG_MATTES=1` is set,
