@@ -28,104 +28,91 @@ fn build() -> Div {
 
 ![Blinc Lottie Player](ScreenRecording2026-04-21at02.52.54-ezgif.com-video-to-gif-converter.gif)
 
-## Status
+## Loading
 
-Early skeleton — loads JSON, exposes metadata. Rendering is stubbed: `draw_at`
-paints a placeholder rect with a playback-progress tick.
+Raw Bodymovin JSON:
 
-## Roadmap
+```rust
+let player = LottiePlayer::from_json(include_str!("scene.json"))?;
+```
 
-Tracked here so the `draw_at` stub doesn't stay a stub by accident. Rough
-ordering — each phase depends on the primitives from the one before.
+dotLottie archives (zipped bundles of `.json` + image / font assets —
+what most exporters and marketplace sites ship now):
 
-> For the **outstanding** items with implementation notes per entry, see
-> [BACKLOG.md](./BACKLOG.md). This README section exists to show what's
-> already landed versus what's still ahead.
+```rust
+let player = LottiePlayer::from_dotlottie_bytes(include_bytes!("scene.lottie"))?;
+```
 
-### Phase 0 — Correctness fixes on the existing surface
+Both v1 (`animations/` layout) and v2 (`a/`) archive shapes are accepted.
+Bundled fonts (`f/` in v2, fonts referenced by a layer's `t.d.k[].fn`) are
+extracted and registered against the global font registry at load time so
+`ty: 5` text layers resolve against the author's intended face.
 
-- [x] **Pause-pose:** `set_playing(false)` now freezes at the last
-      actually-rendered scene time via `last_scene_t`.
-- [x] **Marker/event emission:** `Marker` public type (name + seconds),
-      `on_marker` / `clear_on_marker` callbacks, emission on the
-      `(prev, current]` interval with loop-wrap support. Covered by unit
-      tests.
+## Supported features
 
-### Phase 1 — Minimum viable rendering
+| Area | Support |
+| --- | --- |
+| Layer kinds | Solid (`ty: 1`), Image (`ty: 2`), Null (`ty: 3`), Shape (`ty: 4`), Text (`ty: 5`), Precomp (`ty: 0`) |
+| Transforms | Animated position / scale / rotation / anchor / opacity / skew with linear, hold, and cubic-Bezier eased keyframes |
+| Shape items | `rc`, `el`, `sh`, `gr`, `tr`, `fl`, `st`, `gf`, `gs`, `tm` |
+| Paths | Cubic-Bezier `sh` with per-vertex in/out tangents; keyframed path morphing when vertex count is stable |
+| Strokes | Width / opacity keyframes, dash patterns, miter limit, butt / round / square caps, miter / round / bevel joins |
+| Gradients | Linear + radial, multi-stop with animated stops and alpha stops, object-bounding-box normalised |
+| Trim paths | `tm` with start / end / offset animation, simultaneous + individual modes, identity and empty-window fast paths |
+| Effects | Drop Shadow (`ty: 25`), Gaussian Blur (`ty: 29`), Outer Glow preset (drop-shadow with zero distance) |
+| Masks | Layer-level `masksProperties` with Add mode — composite under the layer's clip stack |
+| Track mattes | Alpha matte (`tt: 1`) pairing the preceding `td`-marked layer as the mask source; polygon clip in the GPU path |
+| Parent chains | Arbitrary-depth layer parenting with forward-reference + cycle guards |
+| Playback | `play`, `pause`, `seek`, loop, reverse, per-sketch scene-time drift, marker events on the frame interval |
+| dotLottie state machines | `LottieStateMachine` executes the `.lottie` archive's state-machine spec — numeric / string / boolean inputs, transitions, event sending |
 
-- [x] **Solid layer** (`ty: 1`) — single color fill. Source-space
-      composition is mapped onto the destination rect (stretch fit;
-      aspect modes deferred). Layers respect `ip` / `op` visibility
-      windows. Transform infrastructure (`anchor`, `position`, `scale`,
-      `rotation`, `opacity`) parses static values today.
-- [x] **Transform keyframes (linear)** (`ks.p`, `ks.s`, `ks.r`, `ks.o`,
-      `ks.a`) — position, scale, rotation, opacity, anchor-point. Linear
-      interpolation, hold keyframes (`h: 1`), clamp-before-first /
-      clamp-after-last semantics.
-- [ ] **Bezier easing** (`i.x` / `o.x` tangent handles on keyframes) —
-      follow-up to linear keyframes; hit unit-parity with AE output.
-- [x] **Shape layer** (`ty: 4`) — rectangles (`rc`) with corner radius,
-      ellipses (`el`) via cubic-bezier path approximation, groups (`gr`)
-      with their own transforms (`tr`) and nested groups. Polystar
-      (`sr`) and path (`sh`) deferred.
-- [x] **Fill** (`fl`) and **Stroke** (`st`) shape items — map to
-      `DrawContext::fill_path` / `stroke_path`. Color and opacity are
-      animatable; stroke width is animatable. Dash patterns + line
-      caps/joins use `Stroke::new` defaults pending Phase 3.
+## Playback controls
 
-### Phase 2 — Path geometry
+```rust
+player.set_playing(true);
+player.seek(1.25); // seconds into the scene timeline
+player.set_loop(true);
+player.on_marker("handshake", |player| { /* ... */ });
+```
 
-- [ ] **Bezier path shape** (`sh`) with vertex/in-tangent/out-tangent arrays
-      → Blinc `Path` with `cubic_to` segments.
-- [ ] **Animated path morphing** — keyframed `sh` where vertex count is
-      stable. Interpolate per-vertex positions.
-- [ ] **Trim paths** (`tm`) — start/end/offset animation for "drawn-on"
-      effects. Requires per-segment length parameterization.
-- [x] **Group** (`gr`) — nested transform + children. (Landed alongside
-      Phase 1.3 — single-fill / single-stroke render model; merge-paths
-      and ordered fill/stroke stacks remain.)
+When paused, the player freezes at the last rendered scene time (via
+`last_scene_t`) rather than snapping to `t = 0`, so pausing looks
+continuous with the previous frame.
 
-### Phase 3 — Visual effects
+## dotLottie state machines
 
-- [ ] **Gradients** (`gf`, `gs`) — linear + radial. Map to Blinc's
-      `Gradient` brush.
-- [ ] **Dash patterns** on strokes.
-- [ ] **Drop shadow / blur / glow** — map to `LayerEffect::DropShadow` /
-      `Blur` / `Glow` where possible.
-- [ ] **Masks** (`masksProperties`) — single-mask + additive/subtractive
-      modes. Maps to Blinc's clip-path system.
+```rust
+let mut sm = LottieStateMachine::from_dotlottie_bytes(bytes)?;
+sm.set_boolean("hovered", true);
+sm.send("click"); // dispatches to the current state's transitions
+```
 
-### Phase 4 — Advanced layer types
+The state machine wraps a `LottiePlayer` and drives its play / seek /
+reverse state from the transitions defined in the archive. Input slots
+(`set_numeric` / `set_string` / `set_boolean`) and explicit `send` calls
+cover the two transition triggers the spec defines.
 
-- [ ] **Text layers** (`ty: 5`) — requires `blinc_text` bridge for font
-      resolution and layout. Skip animated per-character text for MVP.
-- [ ] **Image layers** (`ty: 2`) — requires `blinc_image` bridge. Support
-      base64-inline assets first, external `u`/`p` references after.
-- [ ] **Null layers** (`ty: 3`) — transform-only parents.
-- [ ] **Precomp layers** (`ty: 0`) — nested compositions. Recursive render
-      with its own timeline.
-- [ ] **Track mattes** (`tt`) — alpha/luma mattes between adjacent layers.
+## Cargo features
 
-### Phase 5 — Format + performance
+- **`dotlottie`** (default) — `.lottie` archive parsing plus the state-
+  machine runtime. Pulls in `zip`. Callers who only load raw JSON can
+  disable with `default-features = false`.
+- **`images`** (default) — `ty: 2` image-layer support. Pulls in
+  `blinc_image` for PNG / JPEG / base64 decoding. Disable on vector-only
+  consumers to shed the image-decoding dep.
 
-- [ ] **dotLottie** (`.lottie`) — zip bundle containing `animation.json` +
-      image assets. Needs a `zip` dep.
-- [ ] **Keyframe lookup acceleration** — binary search + per-property
-      cursor so 60fps playback of long timelines doesn't re-scan.
-- [ ] **Off-screen layer culling** — skip `draw_at` work for layers whose
-      transformed bounds fall outside `rect`.
-- [ ] **GPU path caching** — tessellate static shape geometry once and
-      reuse across frames.
+## Non-goals
 
-### Explicit non-goals
+- **Expression layers** (`x: "..."` JavaScript on property values).
+  Porting the AE expression runtime roughly doubles the library
+  footprint for a feature most exports don't use. Revisit when a
+  real consumer actually needs it.
+- **After Effects-only effects** outside the `ty: 25` / `ty: 29`
+  pair — 3D lights, advanced particle emitters, tritone, fill /
+  colour-balance effects. Out of scope — users can stack Blinc's
+  own filter / effect primitives on top of the player.
 
-- **Expression layers** (`x: "..."` JS expressions). Porting the AE
-  expression runtime roughly doubles the library footprint for an
-  edge-case feature most exports don't use. Revisit only if a real
-  consumer demands it.
-- **After Effects-only effects** (Glow, 3D light, particle effects beyond
-  basic emitters). Out of scope — users can composite these themselves
-  using Blinc's own filter/effect stack on top of the Lottie player.
+See [BACKLOG.md](./BACKLOG.md) for the open items and rough priority.
 
 ## License
 
