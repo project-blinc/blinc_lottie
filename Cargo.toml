@@ -32,6 +32,12 @@ blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d0
 # extracted from the `.lottie` archive's `i/` directory. Optional
 # so assets that never use raster layers don't pay for the deps.
 blinc_image = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b", optional = true }
+# Font registry access — `.lottie` archives can bundle font faces
+# under `f/`, and the text layer's `family` field matches them by
+# name. We register bundled TTF / OTF bytes with the global registry
+# at parse time so `from_dotlottie_bytes` surfaces the intended font
+# without requiring the host to plumb it in manually.
+blinc_text = { git = "https://github.com/project-blinc/Blinc.git", rev = "24f9d030e2026194942eab9d028bcac3814ae81b" }
 
 # JSON parsing for Lottie's `.json` / `.lottie` (zipped JSON) format.
 serde = { version = "1.0", features = ["derive"] }
@@ -65,6 +71,7 @@ blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
 blinc_image = { path = "../../crates/blinc_image" }
 blinc_layout = { path = "../../crates/blinc_layout" }
 blinc_platform = { path = "../../crates/blinc_platform" }
+blinc_text = { path = "../../crates/blinc_text" }
 
 [patch."https://github.com/project-blinc/blinc_input.git"]
 blinc_input = { path = "../blinc_input" }

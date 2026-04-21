@@ -95,6 +95,15 @@ pub struct LottiePlayer {
     /// / [`Self::clear_segment`] directly for one-shot trim behaviour
     /// without pulling in the state-machine wrapper.
     segment: Option<(f32, f32)>,
+    /// Font face bytes bundled inside a `.lottie` archive's `f/`
+    /// directory, keyed by filename. Surfaced via
+    /// [`Self::bundled_fonts`] so the host can register them with
+    /// its text renderer before drawing — without that registration
+    /// step, text layers that declare a bundled family (e.g.
+    /// "Cal Sans Regular") fall back to whatever the system picks
+    /// for unknown names. Always empty for `from_json` /
+    /// `from_bytes`.
+    bundled_fonts: Vec<(String, Vec<u8>)>,
 }
 
 impl LottiePlayer {
@@ -164,19 +173,50 @@ impl LottiePlayer {
         let archive = crate::dotlottie::extract(src)?;
         let animation_bytes = archive
             .initial_animation()
-            .ok_or_else(|| Error::Archive("archive declares no animations".to_string()))?;
-        let root: parser::LottieRoot = serde_json::from_slice(animation_bytes)?;
+            .ok_or_else(|| Error::Archive("archive declares no animations".to_string()))?
+            .to_vec();
+        let root: parser::LottieRoot = serde_json::from_slice(&animation_bytes)?;
+        let fonts: Vec<(String, Vec<u8>)> = archive.fonts.into_iter().collect();
         #[cfg(feature = "images")]
-        {
+        let mut player = {
             // Resolve external `assets[].p` references against the
             // archive's own `i/<filename>` entries.
             let images = archive.images;
-            Ok(Self::from_root_with_loader(root, move |_u, p| {
-                images.get(p).cloned()
-            }))
-        }
+            Self::from_root_with_loader(root, move |_u, p| images.get(p).cloned())
+        };
         #[cfg(not(feature = "images"))]
-        Ok(Self::from_root(root))
+        let mut player = Self::from_root(root);
+
+        // Register bundled TTF / OTF bytes with the shared font
+        // registry at parse time. `blinc_text::Renderer::default()`
+        // backs itself with `global_font_registry()`, so a face
+        // loaded here is immediately visible to every text renderer
+        // the host spins up — no explicit plumbing required. A
+        // previously-registered face of the same name is a no-op
+        // inside fontdb (duplicate loads are tolerated), so parsing
+        // the same archive twice doesn't double-count faces.
+        if !fonts.is_empty() {
+            let registry = blinc_text::global_font_registry();
+            let mut reg = registry.lock().expect("global font registry poisoned");
+            for (_name, bytes) in &fonts {
+                reg.load_font_data(bytes.clone());
+            }
+        }
+
+        player.bundled_fonts = fonts;
+        Ok(player)
+    }
+
+    /// Font faces bundled inside a `.lottie` archive's `f/`
+    /// directory, returned as `(filename, raw bytes)` pairs. Register
+    /// them with the host's text renderer (e.g.
+    /// `blinc_text::Renderer::load_font_data_to_registry`) before
+    /// drawing so text layers that declare a bundled family name
+    /// resolve to the bundled face instead of a system fallback.
+    /// Always empty when the player was parsed from
+    /// [`Self::from_json`] / [`Self::from_bytes`].
+    pub fn bundled_fonts(&self) -> &[(String, Vec<u8>)] {
+        &self.bundled_fonts
     }
 
     fn from_root(root: parser::LottieRoot) -> Self {
@@ -267,6 +307,7 @@ impl LottiePlayer {
             last_scene_t: 0.0,
             marker_callback: None,
             segment: None,
+            bundled_fonts: Vec::new(),
         }
     }
 
@@ -319,6 +360,7 @@ impl LottiePlayer {
             last_scene_t: 0.0,
             marker_callback: None,
             segment: None,
+            bundled_fonts: Vec::new(),
         }
     }
 

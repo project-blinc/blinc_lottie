@@ -49,6 +49,16 @@ pub(crate) struct DotLottieArchive {
     /// `assets[].p` filename so `ty: 2` layers referencing an
     /// archive-bundled raster render at their authored size.
     pub images: HashMap<String, Vec<u8>>,
+    /// Font file bytes (TTF / OTF / WOFF / WOFF2) keyed by archive
+    /// filename — e.g. `"Cal Sans Regular.ttf"` for `f/Cal Sans
+    /// Regular.ttf`. The text layer parser reads the family name out
+    /// of the animation JSON (`t.d.k[].s.f`), but the glyph shaper
+    /// can only honour that name when the matching face is registered
+    /// with the text renderer. Surfacing the raw bytes here lets
+    /// [`LottiePlayer::bundled_fonts`] expose them so the host can
+    /// call `blinc_text::Renderer::load_font_data_to_registry` before
+    /// the first draw.
+    pub fonts: HashMap<String, Vec<u8>>,
 }
 
 impl DotLottieArchive {
@@ -203,11 +213,26 @@ pub(crate) fn extract(src: &[u8]) -> Result<DotLottieArchive, Error> {
         }
     }
 
+    // Pull every `f/<filename>` entry regardless of manifest
+    // declaration — dotLottie manifests don't usually enumerate
+    // fonts, so walk the raw filesystem like we do for images. Keep
+    // the bytes unparsed; font-face parsing happens once on the
+    // host side via `blinc_text::Renderer::load_font_data_to_registry`.
+    let mut fonts: HashMap<String, Vec<u8>> = HashMap::new();
+    for (name, bytes) in &files {
+        if let Some(filename) = name.strip_prefix("f/") {
+            if !filename.is_empty() && !filename.ends_with('/') {
+                fonts.insert(filename.to_string(), bytes.clone());
+            }
+        }
+    }
+
     Ok(DotLottieArchive {
         manifest,
         animations,
         state_machines,
         images,
+        fonts,
     })
 }
 
@@ -227,6 +252,7 @@ impl std::fmt::Debug for DotLottieArchive {
                 &self.state_machines.keys().collect::<Vec<_>>(),
             )
             .field("images", &self.images.keys().collect::<Vec<_>>())
+            .field("fonts", &self.fonts.keys().collect::<Vec<_>>())
             .finish()
     }
 }

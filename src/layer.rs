@@ -1834,7 +1834,8 @@ fn render_text_layer(dc: &mut dyn DrawContext, doc: &TextDoc) {
         1.2
     };
     if let Some(family) = &doc.family {
-        style = style.with_family(family.clone());
+        let (base, weight) = normalize_font_family(family);
+        style = style.with_family(base).with_weight(weight);
     }
 
     for (line_idx, line) in doc.text.lines().enumerate() {
@@ -1844,6 +1845,51 @@ fn render_text_layer(dc: &mut dyn DrawContext, doc: &TextDoc) {
         let y = line_idx as f32 * doc.line_height;
         dc.draw_text(line, Point::new(0.0, y), &style);
     }
+}
+
+/// Split a Lottie `f` font name into the family name blinc_text's
+/// registry indexes a face by plus the matching `FontWeight`. Lottie
+/// JSON stores either the PostScript name (`CalSans-Regular`) or the
+/// full display name (`Cal Sans Regular`), but fontdb indexes each
+/// loaded face by its typographic family only (`Cal Sans`) with
+/// style info carried on the side. Passing the raw name straight to
+/// `TextStyle::with_family` misses the registered face and falls
+/// back to the system default — stripping the known style token
+/// ports the weight/slant signal out of the family string and into
+/// `FontWeight`, which the renderer can actually match against.
+fn normalize_font_family(name: &str) -> (String, blinc_core::FontWeight) {
+    use blinc_core::FontWeight;
+
+    // Longest match wins — "Bold Italic" must be checked before
+    // "Bold" so a `Arial-BoldItalic` style suffix doesn't resolve to
+    // just `Arial-Italic` with an orphan `Bold` token left in the
+    // family string.
+    const STYLE_TOKENS: &[(&str, FontWeight)] = &[
+        ("BoldItalic", FontWeight::Bold),
+        ("Bold Italic", FontWeight::Bold),
+        ("Bold", FontWeight::Bold),
+        ("Black", FontWeight::Black),
+        ("Medium", FontWeight::Medium),
+        ("Light", FontWeight::Light),
+        ("Thin", FontWeight::Thin),
+        ("Italic", FontWeight::Regular),
+        ("Regular", FontWeight::Regular),
+        ("Normal", FontWeight::Regular),
+    ];
+
+    for &(token, weight) in STYLE_TOKENS {
+        // Accept both the display-name separator (" ") and the
+        // PostScript-name separator ("-") — AE/Bodymovin exporters
+        // choose between them inconsistently.
+        for sep in [" ", "-"] {
+            let suffix = format!("{sep}{token}");
+            if let Some(base) = name.strip_suffix(&suffix) {
+                return (base.trim().to_string(), weight);
+            }
+        }
+    }
+
+    (name.to_string(), FontWeight::Regular)
 }
 
 /// Push a parent's transform onto the stack without its opacity.
