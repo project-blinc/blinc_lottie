@@ -114,3 +114,8 @@ path = "examples/sandy_loading_dotlottie.rs"
 [[example]]
 name = "lottie_gallery"
 path = "examples/lottie_gallery.rs"
+
+[[example]]
+name = "interactive_volume"
+path = "examples/interactive_volume.rs"
+required-features = ["dotlottie"]
