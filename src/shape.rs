@@ -1280,21 +1280,46 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
     // with six colored fills alternating dark / teal) collapse
     // onto a single last-writer-wins fill and render as one flat
     // blob.
+    //
+    // Child `gr` items that appear BEFORE a paint item in the same
+    // `it[]` also inherit that paint: per Lottie / AE convention a
+    // fill listed after a nested group applies to the nested
+    // group's geometries. Without this, files that factor the
+    // geometry into a sub-group and declare the fill at the outer
+    // group level (the `Interactive_volume.lottie` head uses
+    // exactly that pattern to get a brown skin gradient) render the
+    // nested group with no fill at all and the layer looks black.
     let mut pending_geoms: Vec<Geometry> = Vec::new();
+    let mut pending_children: Vec<ShapeGroup> = Vec::new();
     let mut pending_fill: Option<FillSpec> = None;
     let mut pending_stroke: Option<StrokeSpec> = None;
-    let flush = |geoms: &mut Vec<Geometry>,
-                 fill: &mut Option<FillSpec>,
-                 stroke: &mut Option<StrokeSpec>,
-                 paints: &mut Vec<PaintPass>| {
-        if geoms.is_empty() && fill.is_none() && stroke.is_none() {
-            return;
+    let flush = |pending_geoms: &mut Vec<Geometry>,
+                 pending_children: &mut Vec<ShapeGroup>,
+                 pending_fill: &mut Option<FillSpec>,
+                 pending_stroke: &mut Option<StrokeSpec>,
+                 group: &mut ShapeGroup| {
+        let fill = pending_fill.take();
+        let stroke = pending_stroke.take();
+        // Emit a paint pass for direct geometries at this level.
+        if !pending_geoms.is_empty() || fill.is_some() || stroke.is_some() {
+            if !pending_geoms.is_empty() {
+                group.paints.push(PaintPass {
+                    geometries: std::mem::take(pending_geoms),
+                    fill: fill.clone(),
+                    stroke: stroke.clone(),
+                });
+            }
+            // Propagate the paint into nested children declared
+            // before this flush — only paint passes that don't
+            // already carry their own fill / stroke (i.e. the child
+            // relied on the outer group's paint).
+            if fill.is_some() || stroke.is_some() {
+                for child in pending_children.iter_mut() {
+                    inherit_paint_into_group(child, &fill, &stroke);
+                }
+            }
         }
-        paints.push(PaintPass {
-            geometries: std::mem::take(geoms),
-            fill: fill.take(),
-            stroke: stroke.take(),
-        });
+        group.children.append(pending_children);
     };
     for item in items {
         let Some(ty) = item.get("ty").and_then(Value::as_str) else {
@@ -1309,9 +1334,10 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
                 if pending_fill.is_some() || pending_stroke.is_some() {
                     flush(
                         &mut pending_geoms,
+                        &mut pending_children,
                         &mut pending_fill,
                         &mut pending_stroke,
-                        &mut group.paints,
+                        &mut group,
                     );
                 }
                 match ty {
@@ -1328,7 +1354,7 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
             "gs" => pending_stroke = Some(parse_gradient_stroke(item, fr)),
             "tr" => group.transform = Some(TransformSpec::from_value(Some(item), fr)),
             "tm" => group.trim = Some(parse_trim_path(item, fr)),
-            "gr" => group.children.push(parse_group(item, fr)),
+            "gr" => pending_children.push(parse_group(item, fr)),
             _ => {} // unimplemented item — skip silently
         }
     }
@@ -1336,14 +1362,49 @@ fn parse_group(v: &Value, fr: f32) -> ShapeGroup {
     // array — the common single-fill case lands here.
     flush(
         &mut pending_geoms,
+        &mut pending_children,
         &mut pending_fill,
         &mut pending_stroke,
-        &mut group.paints,
+        &mut group,
     );
     // Ensure a group with no paint items (e.g. only a transform on a
     // parent) still has a zero-length `paints` vec, which the render
     // loop handles as a no-op.
     group
+}
+
+/// Fold an outer group's pending fill / stroke into a child group's
+/// paint passes that lack their own. Called from `parse_group` when
+/// a paint item in the outer `it[]` comes after a nested `gr` —
+/// Lottie / AE semantics make that paint apply to the nested
+/// geometry just as if the author had written the fill inside the
+/// nested group.
+///
+/// Recurses into the child's own children so a two-deep
+/// `gr → gr → sh` layout (seen on the Interactive Volume character)
+/// still picks up the fill declared at the outermost level.
+/// Existing per-pass fills / strokes win — we only fill gaps, never
+/// overwrite the author's intent.
+fn inherit_paint_into_group(
+    group: &mut ShapeGroup,
+    fill: &Option<FillSpec>,
+    stroke: &Option<StrokeSpec>,
+) {
+    for pass in group.paints.iter_mut() {
+        if pass.fill.is_none() {
+            if let Some(f) = fill.as_ref() {
+                pass.fill = Some(f.clone());
+            }
+        }
+        if pass.stroke.is_none() {
+            if let Some(s) = stroke.as_ref() {
+                pass.stroke = Some(s.clone());
+            }
+        }
+    }
+    for child in group.children.iter_mut() {
+        inherit_paint_into_group(child, fill, stroke);
+    }
 }
 
 fn single_item_group(v: &Value, fr: f32) -> Option<ShapeGroup> {

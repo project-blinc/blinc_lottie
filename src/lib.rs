@@ -520,6 +520,55 @@ impl LottiePlayer {
         dc.pop_clip();
     }
 
+    /// Resolve a top-level layer's axis-aligned bounds in the sketch
+    /// coordinate space the player was rendered into with `rect`.
+    /// Returns `None` when the named layer isn't in the root
+    /// composition (nested layers inside precomps aren't searched
+    /// yet) or doesn't carry a cheap-to-compute source bound.
+    ///
+    /// The bounds are AABB-accurate under the same parent-chain +
+    /// own-transform composition the renderer uses; rotation
+    /// produces a conservative enclosing box. Host code hit-tests
+    /// clicks against this to map author-assigned layer names
+    /// (dotLottie `Click` interactions, callouts, tooltip targets)
+    /// onto the actually-rendered pixels.
+    pub fn layer_screen_bounds(
+        &self,
+        layer_name: &str,
+        rect: Rect,
+        scene_t: f32,
+    ) -> Option<Rect> {
+        use blinc_core::layer::Affine2D;
+        let src_w_u = self.root.width.max(1);
+        let src_h_u = self.root.height.max(1);
+        let src_w = src_w_u as f32;
+        let src_h = src_h_u as f32;
+        let fit = aspect_fit(src_w_u, src_h_u, rect);
+        let sx = fit.width() / src_w;
+        let sy = fit.height() / src_h;
+        let local_root = source_to_dest_affine(fit.x(), fit.y(), sx, sy);
+
+        let (idx, layer) = self
+            .layers
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.name.as_deref() == Some(layer_name))?;
+        let _ = idx;
+        let source_bounds = layer.source_bounds(scene_t)?;
+
+        let mut composed: Affine2D = local_root;
+        for &anc_idx in &layer.parent_chain {
+            let anc = layer::layer_local_affine(&self.layers[anc_idx].transform.sample(scene_t));
+            composed = layer::multiply_affines(&composed, &anc);
+        }
+        let own = layer::layer_local_affine(&layer.transform.sample(scene_t));
+        composed = layer::multiply_affines(&composed, &own);
+        Some(layer::transform_rect_through_affine(
+            &composed,
+            source_bounds,
+        ))
+    }
+
     /// Fire the marker callback for every marker whose timestamp falls in
     /// `(prev, current]`, accounting for playback loop wrap.
     fn fire_markers(&mut self, prev: f32, current: f32) {
@@ -752,13 +801,15 @@ pub(crate) fn push_matte_clip(
     if !matted.track_matte.is_active() {
         return false;
     }
-    // The matte source sits at N-1 per Lottie's array convention —
-    // earlier in the array = on top in AE = rendered in front. See
-    // `layer::resolve_matte_pairs` for the full rationale.
-    if matted_idx == 0 {
+    // Walk backward to the nearest preceding matte source. The common
+    // case is `matted_idx - 1`, but consecutive `tt`-active layers can
+    // all share a single `td=1` source further back in the array
+    // (`Interactive_volume.lottie`'s `mask` matting three sibling
+    // layers at once). `resolve_matte_source` handles both shapes.
+    let Some(matte_idx) = layer::resolve_matte_source(layers, matted_idx) else {
         return false;
-    }
-    let matte = &layers[matted_idx - 1];
+    };
+    let matte = &layers[matte_idx];
     let Some(local_path) = matte.extract_matte_path(scene_t) else {
         if *DEBUG_MATTES {
             eprintln!(

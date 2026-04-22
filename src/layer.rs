@@ -80,6 +80,10 @@ pub(crate) struct Layer {
     /// layers are skipped during render — only their shape is
     /// used as a clip for the preceding (matted) layer.
     pub is_matte_source: bool,
+    /// Author-assigned layer name from the JSON's `nm` field.
+    /// Exposed so host code can hit-test `Click` interactions
+    /// that target layers by name.
+    pub name: Option<String>,
 }
 
 /// Track matte mode parsed from Lottie's `tt` field. Per spec:
@@ -951,6 +955,10 @@ impl Layer {
             .and_then(Value::as_u64)
             .map(|n| n != 0)
             .unwrap_or(false);
+        let name = v
+            .get("nm")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
         Self {
             kind,
             in_seconds: in_frames / fr,
@@ -963,6 +971,7 @@ impl Layer {
             effects,
             track_matte,
             is_matte_source,
+            name,
         }
     }
 
@@ -1157,7 +1166,22 @@ impl Layer {
                 // Clip children to the precomp's own canvas bounds.
                 // Content drawn outside `[0, 0, w, h]` is cropped,
                 // matching AE's precomposition viewport.
-                dc.push_clip(ClipShape::Rect(Rect::new(0.0, 0.0, *width, *height)));
+                //
+                // When the authoring tool didn't serialise `w` / `h`
+                // on the precomp layer (Bodymovin 5.7+ omits them on
+                // precomps that inherit the parent composition's
+                // canvas), both default to 0 and a literal `[0, 0, 0,
+                // 0]` clip would cull every child. Fall back to no
+                // clip in that case — the parent composition's clip
+                // stack already bounds the content, and the authored
+                // intent was "use the comp size" rather than "cull
+                // everything". Without this the entire Character /
+                // BG / Volume content of
+                // `Interactive_volume.lottie` disappeared.
+                let has_bounds = *width > 0.0 && *height > 0.0;
+                if has_bounds {
+                    dc.push_clip(ClipShape::Rect(Rect::new(0.0, 0.0, *width, *height)));
+                }
 
                 // Child scene time: start from an `st` offset
                 // (Lottie's "start time" remap — pushes the child
@@ -1211,7 +1235,9 @@ impl Layer {
                     }
                 }
 
-                dc.pop_clip();
+                if has_bounds {
+                    dc.pop_clip();
+                }
             }
             // Null layer has no content of its own — its transform
             // is still useful because children reference it as a
@@ -2021,26 +2047,62 @@ pub(crate) fn transformed_aabb_intersects(
 /// doesn't hunt for a nonexistent clip.
 pub(crate) fn resolve_matte_pairs(layers: &mut [Layer]) {
     let n = layers.len();
+    // Only mark `is_matte_source` on the immediate N-1 layer when it
+    // isn't itself a matted layer — that leaves authored chains of
+    // consecutive `tt`-active layers (all matted by a single earlier
+    // `td=1` source) intact instead of wrongly promoting each matted
+    // layer into a matte source and skipping it during render.
+    // `push_matte_clip` handles the scan-back to find the actual
+    // authored source.
+    //
+    // The "promote N-1" step stays in place for the common single-
+    // pair case (Bodymovin exports that omit the `td` flag on the
+    // matte source but set it on a clip authored inside an AE
+    // precomp) — without it, a `tt`-without-`td` matte would render
+    // the source layer's fill alongside the matted content instead
+    // of treating it as a clip.
     for i in 0..n {
-        if layers[i].track_matte.is_active() {
-            if i > 0 {
-                // Lottie convention (per lottie-docs and lottie-web):
-                // the matte source for a layer with `tt` is the
-                // PREVIOUS layer in the array. In After Effects that
-                // corresponds to the layer sitting ABOVE the matted
-                // layer in the timeline, which exports EARLIER in the
-                // JSON layer array (layers render back-to-front, so
-                // earlier = in front). Flipping this to N-1 is what
-                // makes `td`-marked matte sources line up with the
-                // matted layer's `tt` nomination.
-                layers[i - 1].is_matte_source = true;
-            } else {
-                // Dangling `tt` — drop it so downstream render
-                // doesn't look for an absent matte layer.
-                layers[i].track_matte = TrackMatteType::None;
-            }
+        if !layers[i].track_matte.is_active() {
+            continue;
+        }
+        if i == 0 {
+            // Dangling `tt` — drop it so downstream render doesn't
+            // hunt for a nonexistent clip.
+            layers[i].track_matte = TrackMatteType::None;
+            continue;
+        }
+        if !layers[i - 1].track_matte.is_active() {
+            layers[i - 1].is_matte_source = true;
         }
     }
+}
+
+/// Walk backward from `matted_idx` looking for the nearest preceding
+/// layer flagged as a matte source. Returns the matte-source layer's
+/// index, or `None` if no such layer exists on the way back to the
+/// root of the array.
+///
+/// Handles the "one matte source, multiple matted layers" pattern
+/// (`Interactive_volume.lottie`'s `mask` → Character / BG /
+/// Layer 4 Outlines) by skipping past intermediate matted layers
+/// instead of stopping at N-1.
+pub(crate) fn resolve_matte_source(layers: &[Layer], matted_idx: usize) -> Option<usize> {
+    if matted_idx == 0 {
+        return None;
+    }
+    let mut j = matted_idx;
+    while j > 0 {
+        j -= 1;
+        if layers[j].is_matte_source {
+            return Some(j);
+        }
+        if !layers[j].track_matte.is_active() {
+            // Hit a regular content layer with neither `td` nor
+            // `tt` — the matte chain ended without a source.
+            return None;
+        }
+    }
+    None
 }
 
 pub(crate) fn resolve_parent_chains(layers: &mut [Layer]) {
