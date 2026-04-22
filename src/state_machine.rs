@@ -76,14 +76,44 @@ struct StateMachineSpec {
     /// to the value listed here.
     #[serde(default)]
     inputs: Vec<InputSpec>,
-    /// Interaction callbacks (`OnClick` / `OnPointerEnter` / …)
-    /// map gesture events to `send()` inputs. Parsing them
-    /// requires a host-side event routing layer that doesn't
-    /// exist yet, so for now we keep the field to surface parse
-    /// errors consistently and drop the bodies.
+    /// Interaction callbacks tying external gesture events
+    /// (`Click`, `OnComplete`, …) to Fire / SetBoolean / SetNumeric /
+    /// SetString actions. Parsed into [`InteractionSpec`] at load
+    /// and resolved into the runtime maps on
+    /// [`LottieStateMachine::from_player_and_spec`].
     #[serde(default)]
-    #[allow(dead_code)]
-    interactions: Vec<serde_json::Value>,
+    interactions: Vec<InteractionSpec>,
+}
+
+/// One parsed entry out of the state-machine spec's `interactions`
+/// array. The runtime fans these into two maps:
+///   - `Click { layer_name, … }` — fired by
+///     [`LottieStateMachine::dispatch_click`] when a pointer event
+///     lands inside the named layer's current bounds;
+///   - `OnComplete { state_name, … }` — fired once each time the
+///     named state's playback segment finishes (non-looping
+///     PlaybackStates only — the authored pattern for chaining
+///     transition states into level states).
+///
+/// Unknown variants parse as the `Unsupported` catch-all so spec
+/// extensions don't break archive loading.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum InteractionSpec {
+    Click {
+        #[serde(rename = "layerName")]
+        layer_name: String,
+        #[serde(default)]
+        actions: Vec<ActionSpec>,
+    },
+    OnComplete {
+        #[serde(rename = "stateName")]
+        state_name: String,
+        #[serde(default)]
+        actions: Vec<ActionSpec>,
+    },
+    #[serde(other)]
+    Unsupported,
 }
 
 /// Either a literal `[startFrame, endFrame]` pair or a marker
@@ -398,6 +428,32 @@ pub struct LottieStateMachine {
     /// Active visual crossfade between two segments, if any.
     /// `None` whenever the player renders a single state normally.
     tween: Option<Tween>,
+    /// Actions to run when a non-looping `PlaybackState` finishes its
+    /// segment. Populated from `interactions[].OnComplete` at load.
+    /// `draw_at` consults this after sampling the state's scene
+    /// time — once the segment plays out, the authored actions run
+    /// (typically a `Fire` that cascades the FSM into the next
+    /// level + `SetBoolean` updates on the companion level flag).
+    on_complete_actions: HashMap<StateId, Vec<ActionOp>>,
+    /// Per-state latch so the OnComplete actions fire exactly once
+    /// per state entry. Cleared on state change so re-entering a
+    /// transition state (e.g. returning to `Increase_to_2` after
+    /// `Decrease_to_1`) re-arms the completion callback.
+    on_complete_fired: std::collections::HashSet<StateId>,
+    /// Click interactions: layer-name → actions. Consulted by
+    /// [`Self::dispatch_click`] when a pointer event lands inside
+    /// the named layer's current world bounds.
+    click_interactions: Vec<ClickInteraction>,
+}
+
+/// Resolved `Click` interaction from the spec. Bounded at dispatch
+/// time against the named layer's screen-space bounds — the runtime
+/// doesn't pre-compute positions because the authored layer's
+/// transforms can animate per frame.
+#[derive(Debug, Clone)]
+struct ClickInteraction {
+    layer_name: String,
+    actions: Vec<ActionOp>,
 }
 
 /// Hard cap on `Fire`-driven event cascades inside a single
@@ -643,7 +699,18 @@ impl LottieStateMachine {
                         // Compile per-state playback config alongside
                         // the segment. Defaults mirror the spec: loop
                         // on, no loop cap, forward, speed 1×, autoplay.
-                        let looping = p.r#loop.unwrap_or(true);
+                        // dotLottie spec default for `loop` on a
+                        // PlaybackState is `false` — the state plays
+                        // its segment once and freezes at the terminal
+                        // pose. `Level_N` holding states set
+                        // `"loop": true` explicitly; transition states
+                        // like `Increase_to_2` leave it off so they
+                        // complete and fire their authored
+                        // `OnComplete` interaction. Defaulting to
+                        // `true` trapped the FSM inside every
+                        // transition state because `tick_on_complete`
+                        // short-circuits on looping segments.
+                        let looping = p.r#loop.unwrap_or(false);
                         state_playback.insert(
                             id,
                             StatePlayback {
@@ -717,6 +784,24 @@ impl LottieStateMachine {
                         let next_id = event_names.len() as EventId;
                         event_names.entry(input_name.clone()).or_insert(next_id);
                     }
+                }
+            }
+        }
+        // Also harvest event names from interaction `Fire` actions.
+        // Interactions dispatch outside the FSM's transition walk but
+        // their Fire actions still need stable EventIds so
+        // `LottieStateMachine::send` can route them through the
+        // cascade-drain loop the same way transition-action fires go.
+        for interaction in &spec.interactions {
+            let actions = match interaction {
+                InteractionSpec::Click { actions, .. } => actions,
+                InteractionSpec::OnComplete { actions, .. } => actions,
+                InteractionSpec::Unsupported => continue,
+            };
+            for a in actions {
+                if let ActionSpec::Fire { input_name } = a {
+                    let next_id = event_names.len() as EventId;
+                    event_names.entry(input_name.clone()).or_insert(next_id);
                 }
             }
         }
@@ -871,6 +956,57 @@ impl LottieStateMachine {
             }
         }
 
+        // Resolve `interactions` into the runtime maps. `Click`
+        // entries stash the authored layer name for later
+        // hit-testing; `OnComplete` entries are keyed by the target
+        // state's `StateId` so `draw_at` can look them up after
+        // sampling the state's scene time.
+        let mut click_interactions: Vec<ClickInteraction> = Vec::new();
+        let mut on_complete_actions: HashMap<StateId, Vec<ActionOp>> = HashMap::new();
+        for interaction in &spec.interactions {
+            match interaction {
+                InteractionSpec::Click {
+                    layer_name,
+                    actions,
+                } => {
+                    let resolved: Vec<ActionOp> = actions
+                        .iter()
+                        .filter_map(|a| ActionOp::from_spec(a, &event_names))
+                        .collect();
+                    if resolved.is_empty() {
+                        continue;
+                    }
+                    click_interactions.push(ClickInteraction {
+                        layer_name: layer_name.clone(),
+                        actions: resolved,
+                    });
+                }
+                InteractionSpec::OnComplete {
+                    state_name,
+                    actions,
+                } => {
+                    let Some(&state_id) = state_ids.get(state_name.as_str()) else {
+                        // Unknown state name — drop silently to match
+                        // the lenient-parse contract documented at
+                        // the top of the module.
+                        continue;
+                    };
+                    let resolved: Vec<ActionOp> = actions
+                        .iter()
+                        .filter_map(|a| ActionOp::from_spec(a, &event_names))
+                        .collect();
+                    if resolved.is_empty() {
+                        continue;
+                    }
+                    on_complete_actions
+                        .entry(state_id)
+                        .or_default()
+                        .extend(resolved);
+                }
+                InteractionSpec::Unsupported => {}
+            }
+        }
+
         let fsm = StateMachine::new(initial_id, transitions);
         apply_state_segment(&mut player, initial_id, &state_segments);
 
@@ -888,6 +1024,9 @@ impl LottieStateMachine {
             pending_events,
             tween_edges,
             tween: None,
+            on_complete_actions,
+            on_complete_fired: std::collections::HashSet::new(),
+            click_interactions,
         })
     }
 
@@ -906,6 +1045,9 @@ impl LottieStateMachine {
             pending_events: Arc::new(Mutex::new(Vec::new())),
             tween_edges: HashMap::new(),
             tween: None,
+            on_complete_actions: HashMap::new(),
+            on_complete_fired: std::collections::HashSet::new(),
+            click_interactions: Vec::new(),
         }
     }
 
@@ -1063,6 +1205,13 @@ impl LottieStateMachine {
         // the tween arming pattern.
         self.state_entered_at_t = None;
         self.paused_scene_t = None;
+        // New state entry re-arms its OnComplete callback. Clearing
+        // the flag on the destination lets authored state machines
+        // bounce repeatedly through the same transition state
+        // (e.g. Level_2 → Decrease_to_1 → Level_1 → Increase_to_2
+        // → Level_2 …) without the second pass through
+        // `Increase_to_2` silently skipping its completion event.
+        self.on_complete_fired.remove(&next);
         if let Some(params) = self.tween_edges.get(&(event_id, prev)) {
             if params.to_state == next && params.duration > 0.0 {
                 self.tween = Some(Tween {
@@ -1073,6 +1222,156 @@ impl LottieStateMachine {
                     started_at_t: None,
                 });
             }
+        }
+        true
+    }
+
+    /// Check whether the current state's segment has finished one
+    /// complete pass and run the authored `OnComplete` interaction
+    /// actions if so. Called from `draw_at` after `state_scene_t`
+    /// samples the frame's scene time so the same sketch-time `t`
+    /// drives both the render and the completion latch.
+    ///
+    /// Only non-looping, single-pass `PlaybackState`s complete — a
+    /// looping state runs forever by definition and would fire its
+    /// `OnComplete` every pass if we didn't gate on `looping`.
+    /// Completion fires exactly once per state entry; the
+    /// `on_complete_fired` latch is reset in [`Self::dispatch`]
+    /// when the FSM moves away and then returns to the same state.
+    fn tick_on_complete(&mut self, t: f32) {
+        if self.tween.is_some() {
+            return;
+        }
+        let active = self.fsm.current_state();
+        if self.on_complete_fired.contains(&active) {
+            return;
+        }
+        let Some(pb) = self.state_playback.get(&active).copied() else {
+            return;
+        };
+        if pb.looping && pb.loop_count.is_none() {
+            return;
+        }
+        if !pb.autoplay {
+            return;
+        }
+        let Some(entered) = self.state_entered_at_t else {
+            return;
+        };
+        let duration = (pb.segment_end - pb.segment_start).max(f32::EPSILON);
+        let elapsed = (t - entered).max(0.0) * pb.speed.max(0.0);
+        let passes_needed = pb.loop_count.unwrap_or(1) as f32;
+        if elapsed < duration * passes_needed {
+            return;
+        }
+        // Completion: run authored actions, then drain any `Fire`
+        // events they enqueued so cascading transitions
+        // (`Increase_to_2` → `Level_2`) execute in the same frame.
+        let actions = match self.on_complete_actions.get(&active) {
+            Some(list) => list.clone(),
+            None => {
+                self.on_complete_fired.insert(active);
+                return;
+            }
+        };
+        self.on_complete_fired.insert(active);
+        {
+            let mut store = self.inputs.lock().expect("inputs poisoned");
+            let mut pending = self.pending_events.lock().expect("pending queue poisoned");
+            let mut ctx = ActionContext {
+                store: &mut store,
+                defaults: &self.defaults,
+                pending_events: &mut pending,
+            };
+            for action in &actions {
+                action.apply(&mut ctx);
+            }
+        }
+        // Drain the cascade queue exactly like `send()` does so
+        // `Fire(increaseComplete)` chains into the guarded
+        // `Level_2` transition before the next render.
+        let mut drained = 0usize;
+        loop {
+            let next = {
+                let mut q = self.pending_events.lock().expect("pending queue poisoned");
+                if q.is_empty() || drained >= MAX_CASCADE_DEPTH {
+                    q.clear();
+                    break;
+                }
+                q.remove(0)
+            };
+            drained += 1;
+            self.dispatch(next);
+        }
+    }
+
+    /// Dispatch a pointer-click hit at `point` (in the same sketch-
+    /// local coordinate space the player was rendered into with
+    /// `rect`). Hit-tests every authored `Click` interaction against
+    /// its layer's current bounds at scene time `t`; the first
+    /// interaction whose layer covers the point has its actions
+    /// applied. Returns `true` if any Click interaction fired.
+    ///
+    /// `t` is the sketch time the caller passes to `draw_at` on the
+    /// frame the click occurred — the layer transforms sample
+    /// against this value so moving layers resolve to where they
+    /// were actually drawn, not to a stale previous pose.
+    ///
+    /// This is the runtime side of the authored in-scene controls:
+    /// drop it into the canvas's `on_click` handler and the
+    /// Increase / Decrease speaker buttons (and every other authored
+    /// `Click`) drive the FSM directly.
+    pub fn dispatch_click(&mut self, point: (f32, f32), rect: Rect, t: f32) -> bool {
+        if self.click_interactions.is_empty() {
+            return false;
+        }
+        let scene_t = self.state_scene_t(t).unwrap_or(t);
+        // Scan in authored order; first match wins. Cloning the
+        // actions up-front releases the immutable borrow on
+        // `click_interactions` so the subsequent `apply` can mutate
+        // inputs + pending events.
+        let matched_actions = {
+            let mut actions: Option<Vec<ActionOp>> = None;
+            for interaction in &self.click_interactions {
+                let Some(bounds) =
+                    self.player.layer_screen_bounds(&interaction.layer_name, rect, scene_t)
+                else {
+                    continue;
+                };
+                if bounds.contains(blinc_core::Point::new(point.0, point.1)) {
+                    actions = Some(interaction.actions.clone());
+                    break;
+                }
+            }
+            actions
+        };
+        let Some(actions) = matched_actions else {
+            return false;
+        };
+        {
+            let mut store = self.inputs.lock().expect("inputs poisoned");
+            let mut pending = self.pending_events.lock().expect("pending queue poisoned");
+            let mut ctx = ActionContext {
+                store: &mut store,
+                defaults: &self.defaults,
+                pending_events: &mut pending,
+            };
+            for action in &actions {
+                action.apply(&mut ctx);
+            }
+        }
+        let mut drained = 0usize;
+        loop {
+            let next = {
+                let mut q = self.pending_events.lock().expect("pending queue poisoned");
+                if q.is_empty() || drained >= MAX_CASCADE_DEPTH {
+                    q.clear();
+                    break;
+                }
+                q.remove(0)
+            };
+            drained += 1;
+            self.dispatch(next);
         }
         true
     }
@@ -1172,6 +1471,14 @@ impl Player for LottieStateMachine {
             } else {
                 self.player.draw_at(ctx, rect, t);
             }
+            // Run authored OnComplete interactions AFTER rendering.
+            // If the completion cascade transitions the FSM into a
+            // new state (e.g. `Increase_to_2` → Fire → `Level_2`),
+            // the state change applies to the *next* frame — this
+            // frame still shows the final pose of the completing
+            // state, which matches AE's "OnComplete fires at the
+            // end of the segment, not before" behaviour.
+            self.tick_on_complete(t);
             return;
         }
 
