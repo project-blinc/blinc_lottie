@@ -271,7 +271,8 @@ pub(crate) fn parse_effect(v: &Value, fr: f32) -> Option<EffectSpec> {
             let opacity = parse_animated_scalar(prop_v(1), fr)
                 .unwrap_or(AnimatedF32::Static(255.0))
                 .map(|o| (o / 255.0).clamp(0.0, 1.0));
-            let direction = parse_animated_scalar(prop_v(2), fr).unwrap_or(AnimatedF32::Static(0.0));
+            let direction =
+                parse_animated_scalar(prop_v(2), fr).unwrap_or(AnimatedF32::Static(0.0));
             let distance = parse_animated_scalar(prop_v(3), fr).unwrap_or(AnimatedF32::Static(0.0));
             let softness = parse_animated_scalar(prop_v(4), fr).unwrap_or(AnimatedF32::Static(0.0));
             if is_glow_named || is_zero_scalar(&distance) {
@@ -558,7 +559,10 @@ impl AnimatedF32 {
             Self::Static(v) => Self::Static(f(v)),
             Self::Keyframed(ks) => Self::Keyframed(
                 ks.into_iter()
-                    .map(|k| ScalarKey { value: f(k.value), ..k })
+                    .map(|k| ScalarKey {
+                        value: f(k.value),
+                        ..k
+                    })
                     .collect(),
             ),
         }
@@ -585,7 +589,10 @@ impl AnimatedVec2 {
             Self::Static(v) => Self::Static(f(v)),
             Self::Keyframed(ks) => Self::Keyframed(
                 ks.into_iter()
-                    .map(|k| Vec2Key { value: f(k.value), ..k })
+                    .map(|k| Vec2Key {
+                        value: f(k.value),
+                        ..k
+                    })
                     .collect(),
             ),
         }
@@ -656,9 +663,7 @@ fn solve_bezier_ease(u: f32, out_p: BezierTangent, in_p: BezierTangent) -> f32 {
             break;
         }
         // dB/dt for the x component.
-        let dbx = 3.0 * ut * ut * p1x
-            + 6.0 * ut * t * (p2x - p1x)
-            + 3.0 * t * t * (1.0 - p2x);
+        let dbx = 3.0 * ut * ut * p1x + 6.0 * ut * t * (p2x - p1x) + 3.0 * t * t * (1.0 - p2x);
         if dbx.abs() < 1e-6 {
             // Derivative vanishes — accept the current estimate.
             break;
@@ -852,7 +857,6 @@ pub(crate) struct SampledTransform {
     pub opacity: f32,
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -955,10 +959,7 @@ impl Layer {
             .and_then(Value::as_u64)
             .map(|n| n != 0)
             .unwrap_or(false);
-        let name = v
-            .get("nm")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
+        let name = v.get("nm").and_then(Value::as_str).map(|s| s.to_string());
         Self {
             kind,
             in_seconds: in_frames / fr,
@@ -1014,9 +1015,7 @@ impl Layer {
     /// beyond the vertex convex hull.
     pub fn source_bounds(&self, scene_t: f32) -> Option<Rect> {
         match &self.kind {
-            LayerKind::Solid { width, height, .. } => {
-                Some(Rect::new(0.0, 0.0, *width, *height))
-            }
+            LayerKind::Solid { width, height, .. } => Some(Rect::new(0.0, 0.0, *width, *height)),
             LayerKind::Shape(content) => content.local_bounds(scene_t),
             LayerKind::Text(spec) => {
                 // Conservative estimate — real width requires a
@@ -1034,12 +1033,9 @@ impl Layer {
                 Some(Rect::new(0.0, -doc.size, w, h))
             }
             #[cfg(feature = "images")]
-            LayerKind::Image(spec) => Some(Rect::new(
-                0.0,
-                0.0,
-                spec.width as f32,
-                spec.height as f32,
-            )),
+            LayerKind::Image(spec) => {
+                Some(Rect::new(0.0, 0.0, spec.width as f32, spec.height as f32))
+            }
             LayerKind::Precomp { width, height, .. } => {
                 // Precomps clip to their authored canvas size, so
                 // that rect is a tight cull bound regardless of
@@ -1084,11 +1080,7 @@ impl Layer {
         // `push_layer` creates, so the blur / shadow operates on the
         // layer's composited output. `pop_layer` is matched 1:1.
         let effects_pushed = if !self.effects.is_empty() {
-            let effects = self
-                .effects
-                .iter()
-                .map(|e| e.sample(scene_t))
-                .collect();
+            let effects = self.effects.iter().map(|e| e.sample(scene_t)).collect();
             dc.push_layer(LayerConfig {
                 effects,
                 ..LayerConfig::default()
@@ -1282,10 +1274,7 @@ fn parse_mask(v: &Value, fr: f32) -> MaskSpec {
     let opacity = parse_animated_scalar(v.get("o"), fr)
         .unwrap_or(AnimatedF32::Static(100.0))
         .map(|o| (o / 100.0).clamp(0.0, 1.0));
-    let invert = v
-        .get("inv")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let invert = v.get("inv").and_then(Value::as_bool).unwrap_or(false);
     MaskSpec {
         mode,
         path,
@@ -1333,7 +1322,9 @@ fn parse_precomp(v: &Value, fr: f32, ctx: Option<&AssetContext<'_>>) -> LayerKin
     let width = v.get("w").and_then(Value::as_f64).unwrap_or(0.0) as f32;
     let height = v.get("h").and_then(Value::as_f64).unwrap_or(0.0) as f32;
     let start_frames = v.get("st").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-    let time_remap = v.get("tm").and_then(|tm| parse_animated_scalar(Some(tm), fr));
+    let time_remap = v
+        .get("tm")
+        .and_then(|tm| parse_animated_scalar(Some(tm), fr));
 
     LayerKind::Precomp {
         layers: child_layers,
@@ -1602,9 +1593,7 @@ pub(crate) fn parse_animated_scalar(v: Option<&Value>, fr: f32) -> Option<Animat
             return Some(AnimatedF32::Keyframed(keys));
         }
         // Static array — first element.
-        return Some(AnimatedF32::Static(
-            arr[0].as_f64().unwrap_or(0.0) as f32,
-        ));
+        return Some(AnimatedF32::Static(arr[0].as_f64().unwrap_or(0.0) as f32));
     }
 
     Some(AnimatedF32::Static(0.0))
@@ -1672,10 +1661,7 @@ fn collect_vec4_keys(arr: &[Value], fr: f32) -> Vec<Vec4Key> {
     arr.iter()
         .filter_map(|kf| {
             let t_frames = kf.get("t")?.as_f64()? as f32;
-            let value = kf
-                .get("s")
-                .and_then(vec4_from_s)
-                .unwrap_or(last_value);
+            let value = kf.get("s").and_then(vec4_from_s).unwrap_or(last_value);
             last_value = value;
             let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
             Some(Vec4Key {
@@ -1772,10 +1758,7 @@ fn collect_scalar_keys(arr: &[Value], fr: f32) -> Vec<ScalarKey> {
     arr.iter()
         .filter_map(|kf| {
             let t_frames = kf.get("t")?.as_f64()? as f32;
-            let value = kf
-                .get("s")
-                .and_then(scalar_from_s)
-                .unwrap_or(last_value);
+            let value = kf.get("s").and_then(scalar_from_s).unwrap_or(last_value);
             last_value = value;
             let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
             Some(ScalarKey {
@@ -1794,10 +1777,7 @@ fn collect_vec2_keys(arr: &[Value], fr: f32) -> Vec<Vec2Key> {
     arr.iter()
         .filter_map(|kf| {
             let t_frames = kf.get("t")?.as_f64()? as f32;
-            let value = kf
-                .get("s")
-                .and_then(vec2_from_s)
-                .unwrap_or(last_value);
+            let value = kf.get("s").and_then(vec2_from_s).unwrap_or(last_value);
             last_value = value;
             let hold = kf.get("h").and_then(Value::as_u64).unwrap_or(0) == 1;
             Some(Vec2Key {
@@ -1856,9 +1836,7 @@ pub(crate) fn pop_layer_transform(dc: &mut dyn DrawContext) {
 fn render_text_layer(dc: &mut dyn DrawContext, doc: &TextDoc) {
     use blinc_core::{Color, Point, TextStyle};
     let color = Color::rgba(doc.color[0], doc.color[1], doc.color[2], doc.color[3]);
-    let mut style = TextStyle::default()
-        .with_color(color)
-        .with_align(doc.align);
+    let mut style = TextStyle::default().with_color(color).with_align(doc.align);
     style.size = doc.size;
     style.letter_spacing = doc.tracking;
     style.line_height = if doc.size > 0.0 {
@@ -2014,18 +1992,19 @@ pub(crate) fn transform_rect_through_affine(affine: &Affine2D, source: Rect) -> 
         min_y = min_y.min(p.y);
         max_y = max_y.max(p.y);
     }
-    Rect::new(min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0))
+    Rect::new(
+        min_x,
+        min_y,
+        (max_x - min_x).max(0.0),
+        (max_y - min_y).max(0.0),
+    )
 }
 
 /// Transform `source` through `affine` and check whether the
 /// resulting AABB intersects `dest`. Thin wrapper over
 /// [`transform_rect_through_affine`] + `Rect::intersects` that
 /// reads cleanly at the cull site.
-pub(crate) fn transformed_aabb_intersects(
-    affine: &Affine2D,
-    source: Rect,
-    dest: &Rect,
-) -> bool {
+pub(crate) fn transformed_aabb_intersects(affine: &Affine2D, source: Rect, dest: &Rect) -> bool {
     transform_rect_through_affine(affine, source).intersects(dest)
 }
 
@@ -2219,8 +2198,14 @@ mod tests {
         // (the curve is still flat near the start).
         let midpoint = solve_bezier_ease(0.5, out, in_);
         let quarter = solve_bezier_ease(0.25, out, in_);
-        assert!((midpoint - 0.5).abs() < 0.01, "midpoint ≈ 0.5, got {midpoint}");
-        assert!(quarter < 0.15, "quarter-point should be pulled flat, got {quarter}");
+        assert!(
+            (midpoint - 0.5).abs() < 0.01,
+            "midpoint ≈ 0.5, got {midpoint}"
+        );
+        assert!(
+            quarter < 0.15,
+            "quarter-point should be pulled flat, got {quarter}"
+        );
         // Endpoints must stay fixed — a wandering endpoint would
         // cause visible pose jumps at keyframe boundaries.
         assert!((solve_bezier_ease(0.0, out, in_) - 0.0).abs() < 1e-5);
@@ -2286,11 +2271,27 @@ mod tests {
         let layer = Layer::from_value(&v, 60.0);
         assert_eq!(layer.effects.len(), 1);
         match layer.effects[0].sample(0.0) {
-            LayerEffect::DropShadow { offset_x, offset_y, blur, color, .. } => {
-                assert!((offset_x - 7.07).abs() < 0.05, "offset_x ≈ 7.07, got {offset_x}");
-                assert!((offset_y - 7.07).abs() < 0.05, "offset_y ≈ 7.07, got {offset_y}");
+            LayerEffect::DropShadow {
+                offset_x,
+                offset_y,
+                blur,
+                color,
+                ..
+            } => {
+                assert!(
+                    (offset_x - 7.07).abs() < 0.05,
+                    "offset_x ≈ 7.07, got {offset_x}"
+                );
+                assert!(
+                    (offset_y - 7.07).abs() < 0.05,
+                    "offset_y ≈ 7.07, got {offset_y}"
+                );
                 assert!((blur - 5.0).abs() < 1e-5);
-                assert!((color.a - 128.0 / 255.0).abs() < 1e-3, "alpha = {}", color.a);
+                assert!(
+                    (color.a - 128.0 / 255.0).abs() < 1e-3,
+                    "alpha = {}",
+                    color.a
+                );
             }
             other => panic!("expected DropShadow, got {other:?}"),
         }
@@ -2321,7 +2322,9 @@ mod tests {
         let layer = Layer::from_value(&v, 60.0);
         assert_eq!(layer.effects.len(), 1);
         match layer.effects[0].sample(0.0) {
-            LayerEffect::Glow { blur, range, color, .. } => {
+            LayerEffect::Glow {
+                blur, range, color, ..
+            } => {
                 assert!((blur - 12.0 * 0.7).abs() < 1e-5);
                 assert!((range - 12.0).abs() < 1e-5);
                 // Color opacity fold: 200/255 ≈ 0.784
@@ -2435,7 +2438,11 @@ mod tests {
             ]
         });
         let layer = Layer::from_value(&v, 60.0);
-        assert_eq!(layer.effects.len(), 1, "unsupported effect should drop, blur should stay");
+        assert_eq!(
+            layer.effects.len(),
+            1,
+            "unsupported effect should drop, blur should stay"
+        );
     }
 
     #[test]
@@ -2596,7 +2603,9 @@ mod tests {
         let null = json!({ "ty": 3, "ip": 0, "op": 60 });
         let unknown = json!({ "ty": 99, "ip": 0, "op": 60 });
         assert!(Layer::from_value(&null, 60.0).source_bounds(0.0).is_none());
-        assert!(Layer::from_value(&unknown, 60.0).source_bounds(0.0).is_none());
+        assert!(Layer::from_value(&unknown, 60.0)
+            .source_bounds(0.0)
+            .is_none());
     }
 
     #[cfg(feature = "images")]
@@ -3073,10 +3082,7 @@ mod tests {
         // before walking.
         let a = json!({ "ty": 99, "ind": 1, "parent": 2, "ip": 0, "op": 60 });
         let b = json!({ "ty": 99, "ind": 2, "ip": 0, "op": 60 });
-        let mut layers = vec![
-            Layer::from_value(&a, 60.0),
-            Layer::from_value(&b, 60.0),
-        ];
+        let mut layers = vec![Layer::from_value(&a, 60.0), Layer::from_value(&b, 60.0)];
         resolve_parent_chains(&mut layers);
         assert_eq!(layers[0].parent_chain, vec![1]);
         assert!(layers[1].parent_chain.is_empty());
@@ -3084,10 +3090,7 @@ mod tests {
         // Cyclic parents drop the chain rather than looping.
         let a = json!({ "ty": 99, "ind": 1, "parent": 2, "ip": 0, "op": 60 });
         let b = json!({ "ty": 99, "ind": 2, "parent": 1, "ip": 0, "op": 60 });
-        let mut layers = vec![
-            Layer::from_value(&a, 60.0),
-            Layer::from_value(&b, 60.0),
-        ];
+        let mut layers = vec![Layer::from_value(&a, 60.0), Layer::from_value(&b, 60.0)];
         resolve_parent_chains(&mut layers);
         assert!(layers[0].parent_chain.is_empty(), "cycle should drop chain");
         assert!(layers[1].parent_chain.is_empty(), "cycle should drop chain");
@@ -3164,7 +3167,11 @@ mod tests {
         let layer = Layer::from_value(&v, 60.0);
         // At t=0.5s (midpoint between 0s and 1s keyframes) opacity → 0.5
         let xf = layer.transform.sample(0.5);
-        assert!((xf.opacity - 0.5).abs() < 1e-5, "expected 0.5, got {}", xf.opacity);
+        assert!(
+            (xf.opacity - 0.5).abs() < 1e-5,
+            "expected 0.5, got {}",
+            xf.opacity
+        );
         // Before first keyframe clamps to first.
         assert!((layer.transform.sample(-1.0).opacity - 0.0).abs() < 1e-5);
         // After last keyframe clamps to last.

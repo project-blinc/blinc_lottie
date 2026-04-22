@@ -86,12 +86,7 @@ impl DotLottieArchive {
             .initial
             .as_ref()
             .and_then(|i| i.state_machine.as_deref())
-            .or_else(|| {
-                self.manifest
-                    .state_machines
-                    .first()
-                    .map(|m| m.id.as_str())
-            })?;
+            .or_else(|| self.manifest.state_machines.first().map(|m| m.id.as_str()))?;
         self.state_machines.get(id).map(Vec::as_slice)
     }
 }
@@ -178,12 +173,15 @@ pub(crate) fn extract(src: &[u8]) -> Result<DotLottieArchive, Error> {
     for meta in &manifest.animations {
         let path_v2 = format!("a/{}.json", meta.id);
         let path_v1 = format!("animations/{}.json", meta.id);
-        let bytes = files.get(&path_v2).or_else(|| files.get(&path_v1)).ok_or_else(|| {
-            Error::Archive(format!(
-                "animation '{}' declared in manifest but neither `{}` nor `{}` present",
-                meta.id, path_v2, path_v1
-            ))
-        })?;
+        let bytes = files
+            .get(&path_v2)
+            .or_else(|| files.get(&path_v1))
+            .ok_or_else(|| {
+                Error::Archive(format!(
+                    "animation '{}' declared in manifest but neither `{}` nor `{}` present",
+                    meta.id, path_v2, path_v1
+                ))
+            })?;
         animations.insert(meta.id.clone(), bytes.clone());
     }
 
@@ -287,10 +285,7 @@ mod tests {
     #[test]
     fn extracts_animation_via_manifest_id() {
         let manifest = br#"{"version":"2","animations":[{"id":"main"}]}"#;
-        let archive = make_archive(&[
-            ("manifest.json", manifest),
-            ("a/main.json", minimal_anim()),
-        ]);
+        let archive = make_archive(&[("manifest.json", manifest), ("a/main.json", minimal_anim())]);
         let decoded = extract(&archive).unwrap();
         assert_eq!(decoded.manifest.version, "2");
         assert_eq!(decoded.animations.len(), 1);
@@ -376,10 +371,7 @@ mod tests {
             "animations": [{"id": "a"}],
             "stateMachines": [{"id": "missing"}]
         }"#;
-        let archive = make_archive(&[
-            ("manifest.json", manifest),
-            ("a/a.json", minimal_anim()),
-        ]);
+        let archive = make_archive(&[("manifest.json", manifest), ("a/a.json", minimal_anim())]);
         let decoded = extract(&archive).unwrap();
         assert!(decoded.state_machines.is_empty());
         assert!(decoded.initial_state_machine().is_none());

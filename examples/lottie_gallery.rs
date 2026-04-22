@@ -51,12 +51,12 @@ const ASSETS: &[Asset] = &[
         source: AssetSource::Json(include_str!("assets/Sandy_Loading.json")),
         author: "Parsa Navaei",
     },
-     Asset {
+    Asset {
         name: "Lodader Cat (.lottie)",
         source: AssetSource::DotLottie(include_bytes!("assets/Loader cat.lottie")),
         author: "Diane Picchiottino",
     },
-     Asset {
+    Asset {
         name: "Dark Mode Button (.lottie)",
         source: AssetSource::DotLottie(include_bytes!("assets/Dark Mode Button.lottie")),
         author: "Mohammad Turk",
@@ -193,8 +193,12 @@ fn build_card_by_idx(idx: usize, asset: &'static Asset) -> Div {
                     text(asset.name)
                         .size(13.0)
                         .color(Color::rgba(0.85, 0.85, 0.9, 1.0)),
-                ).child(text(format!("by {}", asset.author)).size(11.0)
-                        .color(Color::rgba(0.85, 0.85, 0.9, 1.0))),
+                )
+                .child(
+                    text(format!("by {}", asset.author))
+                        .size(11.0)
+                        .color(Color::rgba(0.85, 0.85, 0.9, 1.0)),
+                ),
         )
         .child(
             div()
@@ -316,16 +320,16 @@ pub fn build_ui(ctx: &mut WindowedContext) -> impl ElementBuilder {
     let bg = Color::rgba(0.08, 0.08, 0.1, 1.0);
 
     div()
-            .w(w)
-            .h(h)
-            .overflow_y_scroll()
-            .id("gallery_root_base")
-            .bg(bg)
-            .p_px(20.0)
-            .gap_px(10.0)
-            .flex_wrap()
-            .justify_center()
-            .children(cards)
+        .w(w)
+        .h(h)
+        .overflow_y_scroll()
+        .id("gallery_root_base")
+        .bg(bg)
+        .p_px(20.0)
+        .gap_px(10.0)
+        .flex_wrap()
+        .justify_center()
+        .children(cards)
 }
 
 fn main() -> Result<()> {

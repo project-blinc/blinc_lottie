@@ -134,9 +134,18 @@ enum InputSpec {
     /// numeric input would live here too, but the spec's `inputs`
     /// array only declares static defaults — runtime mutation is
     /// what `send_numeric` + `SetNumeric` actions are for.
-    Numeric { name: String, value: f64 },
-    String { name: String, value: String },
-    Boolean { name: String, value: bool },
+    Numeric {
+        name: String,
+        value: f64,
+    },
+    String {
+        name: String,
+        value: String,
+    },
+    Boolean {
+        name: String,
+        value: bool,
+    },
     /// Unknown input type (e.g. `Vector2`, `Color`, `Trigger`)
     /// parses as a no-op so decoding doesn't fail. Trigger inputs
     /// in particular are cascading events — tracked as future work.
@@ -624,9 +633,9 @@ impl LottieStateMachine {
     /// returns `false` for every call, but rendering still works.
     pub fn from_dotlottie_bytes(src: &[u8]) -> Result<Self, Error> {
         let archive = crate::dotlottie::extract(src)?;
-        let anim_bytes = archive.initial_animation().ok_or_else(|| {
-            Error::Archive("archive has no animations to render".to_string())
-        })?;
+        let anim_bytes = archive
+            .initial_animation()
+            .ok_or_else(|| Error::Archive("archive has no animations to render".to_string()))?;
         let player = LottiePlayer::from_bytes(anim_bytes)?;
         match archive.initial_state_machine() {
             Some(sm_bytes) => Self::from_player_and_spec(player, sm_bytes),
@@ -638,10 +647,7 @@ impl LottieStateMachine {
     /// JSON bytes. For callers who managed archive unpacking
     /// themselves (e.g. streamed decoding, test fixtures) rather
     /// than going through [`Self::from_dotlottie_bytes`].
-    pub fn from_player_and_spec(
-        mut player: LottiePlayer,
-        spec_json: &[u8],
-    ) -> Result<Self, Error> {
+    pub fn from_player_and_spec(mut player: LottiePlayer, spec_json: &[u8]) -> Result<Self, Error> {
         let spec: StateMachineSpec = serde_json::from_slice(spec_json)?;
         let fr = player.frame_rate();
 
@@ -689,9 +695,7 @@ impl LottieStateMachine {
                             .get(name.as_str())
                             .map(|(t, d)| (*t, *t + d.max(0.0))),
                         None => p.marker.as_deref().and_then(|name| {
-                            marker_table
-                                .get(name)
-                                .map(|(t, d)| (*t, *t + d.max(0.0)))
+                            marker_table.get(name).map(|(t, d)| (*t, *t + d.max(0.0)))
                         }),
                     };
                     if let Some((start_s, end_s)) = resolved {
@@ -768,7 +772,9 @@ impl LottieStateMachine {
         for entry in &spec.states {
             for t in entry_transitions(entry) {
                 let (guards, actions) = match t {
-                    TransitionSpec::Transition { guards, actions, .. }
+                    TransitionSpec::Transition {
+                        guards, actions, ..
+                    }
                     | TransitionSpec::Tweened {
                         guards, actions, ..
                     } => (guards, actions),
@@ -872,12 +878,7 @@ impl LottieStateMachine {
                         actions,
                         duration,
                         easing,
-                    } => (
-                        to_state,
-                        guards,
-                        actions,
-                        Some((*duration, *easing)),
-                    ),
+                    } => (to_state, guards, actions, Some((*duration, *easing))),
                 };
                 let to_id = *state_ids.get(to_name).ok_or_else(|| {
                     Error::Archive(format!(
@@ -1334,7 +1335,8 @@ impl LottieStateMachine {
             let mut actions: Option<Vec<ActionOp>> = None;
             for interaction in &self.click_interactions {
                 let Some(bounds) =
-                    self.player.layer_screen_bounds(&interaction.layer_name, rect, scene_t)
+                    self.player
+                        .layer_screen_bounds(&interaction.layer_name, rect, scene_t)
                 else {
                     continue;
                 };
@@ -1701,19 +1703,40 @@ impl Condition {
 /// [`InputDefaults`] snapshot at apply time.
 #[derive(Debug, Clone)]
 enum ActionOp {
-    SetNumeric { name: String, value: f64 },
-    SetString { name: String, value: String },
-    SetBoolean { name: String, value: bool },
-    Toggle { name: String },
-    Increment { name: String, value: f64 },
-    Decrement { name: String, value: f64 },
+    SetNumeric {
+        name: String,
+        value: f64,
+    },
+    SetString {
+        name: String,
+        value: String,
+    },
+    SetBoolean {
+        name: String,
+        value: bool,
+    },
+    Toggle {
+        name: String,
+    },
+    Increment {
+        name: String,
+        value: f64,
+    },
+    Decrement {
+        name: String,
+        value: f64,
+    },
     /// Queue an event for cascaded dispatch after the current
     /// transition completes. `send()` drains the queue in
     /// insertion order.
-    Fire { event: EventId },
+    Fire {
+        event: EventId,
+    },
     /// Restore an input to its author-declared default, or clear
     /// it entirely when no default was declared.
-    Reset { name: String },
+    Reset {
+        name: String,
+    },
 }
 
 impl ActionOp {
@@ -2034,8 +2057,15 @@ mod tests {
         assert!(!sm.is_tweening());
         assert!(sm.send("go"));
         assert_eq!(sm.current_state_name(), "b");
-        assert!(sm.is_tweening(), "tween should arm after Tweened transition");
-        assert_eq!(sm.player().segment(), Some((1.0, 2.0)), "segment already on dest");
+        assert!(
+            sm.is_tweening(),
+            "tween should arm after Tweened transition"
+        );
+        assert_eq!(
+            sm.player().segment(),
+            Some((1.0, 2.0)),
+            "segment already on dest"
+        );
     }
 
     #[test]
@@ -2334,7 +2364,11 @@ mod tests {
         assert!(sm.send("go"));
         assert_eq!(sm.get_numeric("counter"), Some(99.0));
         assert!(sm.send("back"));
-        assert_eq!(sm.get_numeric("counter"), Some(3.0), "reset should restore default");
+        assert_eq!(
+            sm.get_numeric("counter"),
+            Some(3.0),
+            "reset should restore default"
+        );
 
         // Reset on an undeclared input clears it — no phantom zero.
         sm.set_numeric("adhoc", 5.0);
@@ -2378,7 +2412,11 @@ mod tests {
         let player = LottiePlayer::from_json(FIXTURE_ANIM).unwrap();
         let mut sm = LottieStateMachine::from_player_and_spec(player, spec.as_bytes()).unwrap();
         assert!(sm.send("kick"));
-        assert_eq!(sm.current_state_name(), "c", "cascade should land on final state");
+        assert_eq!(
+            sm.current_state_name(),
+            "c",
+            "cascade should land on final state"
+        );
     }
 
     #[test]
@@ -2546,15 +2584,27 @@ mod tests {
 
     #[test]
     fn reverse_mode_accepts_authored_string() {
-        assert!(matches!(PlaybackMode::from_str("Forward"), PlaybackMode::Forward));
-        assert!(matches!(PlaybackMode::from_str("Reverse"), PlaybackMode::Reverse));
-        assert!(matches!(PlaybackMode::from_str("Bounce"), PlaybackMode::Bounce));
+        assert!(matches!(
+            PlaybackMode::from_str("Forward"),
+            PlaybackMode::Forward
+        ));
+        assert!(matches!(
+            PlaybackMode::from_str("Reverse"),
+            PlaybackMode::Reverse
+        ));
+        assert!(matches!(
+            PlaybackMode::from_str("Bounce"),
+            PlaybackMode::Bounce
+        ));
         assert!(matches!(
             PlaybackMode::from_str("ReverseBounce"),
             PlaybackMode::ReverseBounce
         ));
         // Unknown → fallback to Forward.
-        assert!(matches!(PlaybackMode::from_str("wat"), PlaybackMode::Forward));
+        assert!(matches!(
+            PlaybackMode::from_str("wat"),
+            PlaybackMode::Forward
+        ));
     }
 
     #[test]

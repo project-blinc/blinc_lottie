@@ -570,10 +570,8 @@ impl PaintPass {
                         .with_join(stroke.join);
                     builder.miter_limit = stroke.miter_limit;
                     if !stroke.dash_pattern.is_empty() {
-                        builder = builder.with_dash(
-                            stroke.dash_pattern.clone(),
-                            stroke.dash_offset.sample(t),
-                        );
+                        builder = builder
+                            .with_dash(stroke.dash_pattern.clone(), stroke.dash_offset.sample(t));
                     }
                     dc.stroke_path(path, &builder, brush);
                 }
@@ -713,7 +711,10 @@ fn merge_rects(existing: Option<Rect>, next: Rect) -> Rect {
 /// transforms work because Lottie exports arcs as cubic beziers
 /// almost exclusively; `ArcTo` still passes through correctly for
 /// the non-Lottie caller that might sit on top of this helper.
-fn transform_path_command(cmd: &PathCommand, affine: Option<&blinc_core::layer::Affine2D>) -> PathCommand {
+fn transform_path_command(
+    cmd: &PathCommand,
+    affine: Option<&blinc_core::layer::Affine2D>,
+) -> PathCommand {
     let apply = |p: Point| match affine {
         None => p,
         Some(a) => {
@@ -825,7 +826,10 @@ fn sample_trim_window(spec: &TrimPathSpec, t: f32) -> TrimWindow {
     // which would destroy the identity case (s=0, e=1, offset=0).
     // Detect it before folding so `is_identity()` keeps working.
     if e - s >= 1.0 - 1e-6 {
-        return TrimWindow { start: 0.0, end: 1.0 };
+        return TrimWindow {
+            start: 0.0,
+            end: 1.0,
+        };
     }
     let offset = (spec.offset.sample(t) / 360.0).rem_euclid(1.0);
     let start = (s + offset).rem_euclid(1.0);
@@ -929,9 +933,9 @@ fn flatten_subpaths(path: &Path) -> Vec<Vec<Point>> {
     let mut subpath_start = current;
     let mut have_subpath = false;
     let begin_subpath = |pt: Point,
-                             out: &mut Vec<Vec<Point>>,
-                             have_subpath: &mut bool,
-                             subpath_start: &mut Point| {
+                         out: &mut Vec<Vec<Point>>,
+                         have_subpath: &mut bool,
+                         subpath_start: &mut Point| {
         out.push(vec![pt]);
         *subpath_start = pt;
         *have_subpath = true;
@@ -1175,7 +1179,12 @@ fn path_bounds(shape: &PathShape) -> Option<Rect> {
     if !min_x.is_finite() {
         return None;
     }
-    Some(Rect::new(min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0)))
+    Some(Rect::new(
+        min_x,
+        min_y,
+        (max_x - min_x).max(0.0),
+        (max_y - min_y).max(0.0),
+    ))
 }
 
 /// Build a closed cubic-bezier approximation of an axis-aligned ellipse.
@@ -1443,8 +1452,7 @@ fn parse_rectangle(v: &Value, fr: f32) -> Geometry {
     Geometry::Rectangle {
         position: parse_animated_vec2(v.get("p"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0])),
         size: parse_animated_vec2(v.get("s"), fr).unwrap_or(AnimatedVec2::Static([0.0, 0.0])),
-        corner_radius: parse_animated_scalar(v.get("r"), fr)
-            .unwrap_or(AnimatedF32::Static(0.0)),
+        corner_radius: parse_animated_scalar(v.get("r"), fr).unwrap_or(AnimatedF32::Static(0.0)),
     }
 }
 
@@ -1506,10 +1514,7 @@ fn path_shape_from_value(v: &Value) -> Option<PathShape> {
     let vertices = parse_point_array(v.get("v")?)?;
     let in_tangents = parse_point_array(v.get("i")?)?;
     let out_tangents = parse_point_array(v.get("o")?)?;
-    let closed = v
-        .get("c")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let closed = v.get("c").and_then(Value::as_bool).unwrap_or(false);
     if vertices.len() != in_tangents.len() || vertices.len() != out_tangents.len() {
         return None;
     }
@@ -1730,13 +1735,19 @@ fn extract_static_stop_array(gk: &Value) -> Option<Vec<f32>> {
             .unwrap_or(false)
         {
             let first = arr.first()?;
-            return first
-                .get("s")
-                .and_then(Value::as_array)
-                .map(|s_arr| s_arr.iter().filter_map(|n| n.as_f64().map(|n| n as f32)).collect());
+            return first.get("s").and_then(Value::as_array).map(|s_arr| {
+                s_arr
+                    .iter()
+                    .filter_map(|n| n.as_f64().map(|n| n as f32))
+                    .collect()
+            });
         }
         // Static flat array.
-        return Some(arr.iter().filter_map(|n| n.as_f64().map(|n| n as f32)).collect());
+        return Some(
+            arr.iter()
+                .filter_map(|n| n.as_f64().map(|n| n as f32))
+                .collect(),
+        );
     }
     None
 }
@@ -1883,11 +1894,15 @@ mod tests {
         assert_eq!(g.paints[1].geometries.len(), 1);
         assert_eq!(g.paints[2].geometries.len(), 1);
         let first_color = match &g.paints[0].fill.as_ref().unwrap().paint {
-            Paint::Solid(c) => sample_paint_color(c, &g.paints[0].fill.as_ref().unwrap().opacity, 0.0),
+            Paint::Solid(c) => {
+                sample_paint_color(c, &g.paints[0].fill.as_ref().unwrap().opacity, 0.0)
+            }
             _ => panic!("expected solid fill"),
         };
         let middle_color = match &g.paints[1].fill.as_ref().unwrap().paint {
-            Paint::Solid(c) => sample_paint_color(c, &g.paints[1].fill.as_ref().unwrap().opacity, 0.0),
+            Paint::Solid(c) => {
+                sample_paint_color(c, &g.paints[1].fill.as_ref().unwrap().opacity, 0.0)
+            }
             _ => panic!("expected solid fill"),
         };
         assert!((first_color.r - 0.1137).abs() < 1e-3, "first pass dark");
@@ -1966,7 +1981,11 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        assert_eq!(content.groups[0].all_geometries().len(), 1, "rect should still parse");
+        assert_eq!(
+            content.groups[0].all_geometries().len(),
+            1,
+            "rect should still parse"
+        );
     }
 
     #[test]
@@ -2014,7 +2033,11 @@ mod tests {
             mode: TrimMode::Individual,
         };
         let window = sample_trim_window(&spec, 0.0);
-        assert!((window.start - 0.375).abs() < 1e-5, "start = {}", window.start);
+        assert!(
+            (window.start - 0.375).abs() < 1e-5,
+            "start = {}",
+            window.start
+        );
         assert!((window.end - 0.875).abs() < 1e-5, "end = {}", window.end);
         assert!(window.has_visible_range());
 
@@ -2050,7 +2073,10 @@ mod tests {
             .move_to(0.0, 0.0)
             .line_to(2.0, 0.0)
             .line_to(4.0, 0.0);
-        let window = TrimWindow { start: 0.0, end: 0.5 };
+        let window = TrimWindow {
+            start: 0.0,
+            end: 0.5,
+        };
         let trimmed = apply_trim(&path, window);
         let commands = trimmed.commands();
         // MoveTo + at least one LineTo; final endpoint ≈ (2, 0).
@@ -2059,7 +2085,11 @@ mod tests {
             PathCommand::LineTo(p) => *p,
             other => panic!("expected LineTo, got {other:?}"),
         };
-        assert!((last_pt.x - 2.0).abs() < 1e-3, "end x ≈ 2, got {}", last_pt.x);
+        assert!(
+            (last_pt.x - 2.0).abs() < 1e-3,
+            "end x ≈ 2, got {}",
+            last_pt.x
+        );
         assert!(last_pt.y.abs() < 1e-3);
     }
 
@@ -2076,7 +2106,10 @@ mod tests {
             .line_to(0.0, 0.0);
         // Window [0.75, 0.25] after offset-folding represents a
         // wrap (start > end) — two slice emissions.
-        let window = TrimWindow { start: 0.75, end: 0.25 };
+        let window = TrimWindow {
+            start: 0.75,
+            end: 0.25,
+        };
         let trimmed = apply_trim(&path, window);
         // Expect two MoveTo commands: one per slice.
         let move_tos = trimmed
@@ -2102,7 +2135,10 @@ mod tests {
             .line_to(4.0, 0.0)
             .move_to(0.0, 1.0)
             .line_to(8.0, 1.0);
-        let window = TrimWindow { start: 0.0, end: 0.5 };
+        let window = TrimWindow {
+            start: 0.0,
+            end: 0.5,
+        };
         let trimmed = apply_trim(&path, window);
         // Expect two subpaths in output: one for the full first
         // subpath (4 units) and one for the partial second
@@ -2132,13 +2168,21 @@ mod tests {
         // single Path (the `Individual` mode's per-geometry call
         // pattern), arc length is the subpath's own — matches
         // pre-refactor semantics.
-        let path = Path::new()
-            .move_to(0.0, 0.0)
-            .line_to(10.0, 0.0);
-        let trimmed = apply_trim(&path, TrimWindow { start: 0.0, end: 0.5 });
+        let path = Path::new().move_to(0.0, 0.0).line_to(10.0, 0.0);
+        let trimmed = apply_trim(
+            &path,
+            TrimWindow {
+                start: 0.0,
+                end: 0.5,
+            },
+        );
         let last = trimmed.commands().last().unwrap();
         if let PathCommand::LineTo(p) = last {
-            assert!((p.x - 5.0).abs() < 0.01, "single-subpath trim → half length, got {}", p.x);
+            assert!(
+                (p.x - 5.0).abs() < 0.01,
+                "single-subpath trim → half length, got {}",
+                p.x
+            );
         } else {
             panic!("expected LineTo");
         }
@@ -2315,7 +2359,9 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let fill = content.groups[0].first_fill().expect("gradient fill parsed");
+        let fill = content.groups[0]
+            .first_fill()
+            .expect("gradient fill parsed");
         let Paint::LinearGradient { stops, .. } = &fill.paint else {
             panic!("expected linear gradient, got {:?}", fill.paint);
         };
@@ -2357,7 +2403,9 @@ mod tests {
             }
         ]));
         let content = ShapeContent::from_layer(&v, 60.0);
-        let stroke = content.groups[0].first_stroke().expect("gradient stroke parsed");
+        let stroke = content.groups[0]
+            .first_stroke()
+            .expect("gradient stroke parsed");
         assert!(matches!(stroke.paint, Paint::RadialGradient { .. }));
         assert!((stroke.width.sample(0.0) - 3.0).abs() < 1e-5);
     }

@@ -260,8 +260,7 @@ impl LottiePlayer {
             let Some(id) = asset.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            let Some(layers_arr) = asset.get("layers").and_then(serde_json::Value::as_array)
-            else {
+            let Some(layers_arr) = asset.get("layers").and_then(serde_json::Value::as_array) else {
                 continue;
             };
             precomp_layers.insert(id.to_string(), layers_arr.as_slice());
@@ -333,8 +332,7 @@ impl LottiePlayer {
             let Some(id) = asset.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            let Some(layers_arr) = asset.get("layers").and_then(serde_json::Value::as_array)
-            else {
+            let Some(layers_arr) = asset.get("layers").and_then(serde_json::Value::as_array) else {
                 continue;
             };
             precomp_layers.insert(id.to_string(), layers_arr.as_slice());
@@ -532,12 +530,7 @@ impl LottiePlayer {
     /// clicks against this to map author-assigned layer names
     /// (dotLottie `Click` interactions, callouts, tooltip targets)
     /// onto the actually-rendered pixels.
-    pub fn layer_screen_bounds(
-        &self,
-        layer_name: &str,
-        rect: Rect,
-        scene_t: f32,
-    ) -> Option<Rect> {
+    pub fn layer_screen_bounds(&self, layer_name: &str, rect: Rect, scene_t: f32) -> Option<Rect> {
         use blinc_core::layer::Affine2D;
         let src_w_u = self.root.width.max(1);
         let src_h_u = self.root.height.max(1);
@@ -870,8 +863,14 @@ pub(crate) fn push_matte_clip(
         if let (Some(first), Some(last)) = (vertices.first(), vertices.last()) {
             let min_x = vertices.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
             let min_y = vertices.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
-            let max_x = vertices.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-            let max_y = vertices.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+            let max_x = vertices
+                .iter()
+                .map(|p| p.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let max_y = vertices
+                .iter()
+                .map(|p| p.y)
+                .fold(f32::NEG_INFINITY, f32::max);
             eprintln!(
                 "[lottie] matte push: matted_ind={:?} idx={} matte_ind={:?} verts={} bbox=({:.1},{:.1})->({:.1},{:.1}) first=({:.1},{:.1}) last=({:.1},{:.1})",
                 matted.ind,
@@ -962,11 +961,17 @@ fn flatten_path_to_polygon(
                 verts.push(apply(cx, cy));
             }
             PathCommand::QuadTo { control, end } => {
-                subdivide_quad(&mut verts, &apply, cx, cy, control.x, control.y, end.x, end.y, 0);
+                subdivide_quad(
+                    &mut verts, &apply, cx, cy, control.x, control.y, end.x, end.y, 0,
+                );
                 cx = end.x;
                 cy = end.y;
             }
-            PathCommand::CubicTo { control1, control2, end } => {
+            PathCommand::CubicTo {
+                control1,
+                control2,
+                end,
+            } => {
                 subdivide_cubic(
                     &mut verts, &apply, cx, cy, control1.x, control1.y, control2.x, control2.y,
                     end.x, end.y, 0,
@@ -993,10 +998,14 @@ fn flatten_path_to_polygon(
 fn subdivide_cubic(
     out: &mut Vec<blinc_core::layer::Point>,
     apply: &impl Fn(f32, f32) -> blinc_core::layer::Point,
-    x0: f32, y0: f32,
-    x1: f32, y1: f32,
-    x2: f32, y2: f32,
-    x3: f32, y3: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    x3: f32,
+    y3: f32,
     depth: u32,
 ) {
     const MAX_DEPTH: u32 = 6;
@@ -1034,17 +1043,44 @@ fn subdivide_cubic(
     let mx = (m012x + m123x) * 0.5;
     let my = (m012y + m123y) * 0.5;
 
-    subdivide_cubic(out, apply, x0, y0, m01x, m01y, m012x, m012y, mx, my, depth + 1);
-    subdivide_cubic(out, apply, mx, my, m123x, m123y, m23x, m23y, x3, y3, depth + 1);
+    subdivide_cubic(
+        out,
+        apply,
+        x0,
+        y0,
+        m01x,
+        m01y,
+        m012x,
+        m012y,
+        mx,
+        my,
+        depth + 1,
+    );
+    subdivide_cubic(
+        out,
+        apply,
+        mx,
+        my,
+        m123x,
+        m123y,
+        m23x,
+        m23y,
+        x3,
+        y3,
+        depth + 1,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn subdivide_quad(
     out: &mut Vec<blinc_core::layer::Point>,
     apply: &impl Fn(f32, f32) -> blinc_core::layer::Point,
-    x0: f32, y0: f32,
-    qx: f32, qy: f32,
-    x2: f32, y2: f32,
+    x0: f32,
+    y0: f32,
+    qx: f32,
+    qy: f32,
+    x2: f32,
+    y2: f32,
     depth: u32,
 ) {
     const MAX_DEPTH: u32 = 6;
@@ -1175,7 +1211,9 @@ mod tests {
         let loader_calls: std::cell::RefCell<Vec<(String, String)>> =
             std::cell::RefCell::new(Vec::new());
         let player = LottiePlayer::from_json_with_loader(src, |u, p| {
-            loader_calls.borrow_mut().push((u.to_string(), p.to_string()));
+            loader_calls
+                .borrow_mut()
+                .push((u.to_string(), p.to_string()));
             if p == "img_0.png" {
                 Some(PNG_BYTES.to_vec())
             } else {
@@ -1232,7 +1270,10 @@ mod tests {
         let (mut p, seen) = player_with_recorder();
         // Cross 0.5s and 1.5s — "a" and "b" fire; "c" (at 2.5) is past.
         p.fire_markers(0.0, 2.0);
-        assert_eq!(*seen.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -1253,7 +1294,10 @@ mod tests {
         let got = seen.lock().unwrap().clone();
         assert!(got.contains(&"c".to_string()), "expected c in {got:?}");
         assert!(got.contains(&"a".to_string()), "expected a in {got:?}");
-        assert!(!got.contains(&"b".to_string()), "b should not fire, got {got:?}");
+        assert!(
+            !got.contains(&"b".to_string()),
+            "b should not fire, got {got:?}"
+        );
     }
 
     #[test]
@@ -1339,7 +1383,10 @@ mod tests {
         let translucency_observed = any_half
             || any_fifth
             || fills_under_translucency > 0
-            || rec.commands().iter().any(|c| matches!(c, DrawCommand::PushLayer(_)));
+            || rec
+                .commands()
+                .iter()
+                .any(|c| matches!(c, DrawCommand::PushLayer(_)));
         assert!(
             translucency_observed,
             "no translucency signal in command stream — pushes={:?} fills={}",
