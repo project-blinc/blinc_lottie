@@ -32,7 +32,7 @@ rust-version = "1.75"
 # Bump the canvas_kit rev independently of the Blinc rev. The `[patch]`
 # block at the bottom redirects both URLs to the colocated checkouts
 # under `../../packages/` for in-Blinc-workspace iteration.
-blinc_canvas_kit = { git = "https://github.com/project-blinc/blinc_canvas_kit.git", rev = "d07badb7d060dff63647a3afb46a5b58fd8a499e" }
+blinc_canvas_kit = { git = "https://github.com/project-blinc/blinc_canvas_kit.git", rev = "5a932e1273904302e15ec7bcd6a7bd797535cbe0" }
 blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "aa5ed9b80ad21e6abeed3a1eb4b62af1d8ad6a05" }
 # Image decoding for `ty: 2` image layers — handles base64 data
 # URIs embedded in `assets[].p` as well as raw PNG / JPEG bytes
