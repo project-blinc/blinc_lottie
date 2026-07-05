@@ -33,18 +33,18 @@ rust-version = "1.75"
 # block at the bottom redirects both URLs to the colocated checkouts
 # under `../../packages/` for in-Blinc-workspace iteration.
 blinc_canvas_kit = { git = "https://github.com/project-blinc/blinc_canvas_kit.git", rev = "3bc3f570dbe16e8f72c892e9fbad64cb7cd9af95" }
-blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "aa5ed9b8e949d40a0012612b5880e89934ef69de" }
+blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "469e9e556a7b4eb8b9e68f9392a131e823889d36" }
 # Image decoding for `ty: 2` image layers — handles base64 data
 # URIs embedded in `assets[].p` as well as raw PNG / JPEG bytes
 # extracted from the `.lottie` archive's `i/` directory. Optional
 # so assets that never use raster layers don't pay for the deps.
-blinc_image = { git = "https://github.com/project-blinc/Blinc.git", rev = "aa5ed9b8e949d40a0012612b5880e89934ef69de", optional = true }
+blinc_image = { git = "https://github.com/project-blinc/Blinc.git", rev = "469e9e556a7b4eb8b9e68f9392a131e823889d36", optional = true }
 # Font registry access — `.lottie` archives can bundle font faces
 # under `f/`, and the text layer's `family` field matches them by
 # name. We register bundled TTF / OTF bytes with the global registry
 # at parse time so `from_dotlottie_bytes` surfaces the intended font
 # without requiring the host to plumb it in manually.
-blinc_text = { git = "https://github.com/project-blinc/Blinc.git", rev = "aa5ed9b8e949d40a0012612b5880e89934ef69de" }
+blinc_text = { git = "https://github.com/project-blinc/Blinc.git", rev = "469e9e556a7b4eb8b9e68f9392a131e823889d36" }
 
 # JSON parsing for Lottie's `.json` / `.lottie` (zipped JSON) format.
 serde = { version = "1.0", features = ["derive"] }
